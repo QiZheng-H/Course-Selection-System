@@ -4,7 +4,7 @@
  * 全部内容来自学校官方发布的 2024 级本科培养计划，并展示原文件、来源网址与具体页码。
  * 教师、教学班时间与容量属于演示模拟配置，页面顶部单独标注。
  */
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { api } from '@/api/client';
 import { reportApiError } from '@/stores/toast';
 import type { StudentProgramPlan } from '@/api/types';
@@ -14,6 +14,8 @@ const plan = ref<StudentProgramPlan | null>(null);
 const loading = ref(false);
 const activeModuleCode = ref<string | null>(null);
 const onlyUnsatisfied = ref(false);
+/** 课程明细抽屉：从右侧滑出，不再堆在页面底部 */
+const drawerOpen = ref(false);
 
 const modules = computed(() => plan.value?.modules ?? []);
 
@@ -24,6 +26,24 @@ const visibleModules = computed(() => {
 });
 
 const activeModule = computed(() => modules.value.find((module) => module.code === activeModuleCode.value) ?? null);
+
+function openModule(moduleCode: string): void {
+  activeModuleCode.value = moduleCode;
+  drawerOpen.value = true;
+}
+
+function closeDrawer(): void {
+  drawerOpen.value = false;
+}
+
+function onKeydown(event: KeyboardEvent): void {
+  if (event.key === 'Escape' && drawerOpen.value) closeDrawer();
+}
+
+// 抽屉打开时锁定页面滚动，关闭后恢复
+watch(drawerOpen, (open) => {
+  document.body.style.overflow = open ? 'hidden' : '';
+});
 
 async function load(): Promise<void> {
   loading.value = true;
@@ -39,7 +59,15 @@ async function load(): Promise<void> {
   }
 }
 
-onMounted(load);
+onMounted(() => {
+  void load();
+  window.addEventListener('keydown', onKeydown);
+});
+
+onUnmounted(() => {
+  window.removeEventListener('keydown', onKeydown);
+  document.body.style.overflow = '';
+});
 </script>
 
 <template>
@@ -127,14 +155,7 @@ onMounted(load);
               <td>{{ module.courses.length }}</td>
               <td class="small muted">{{ module.sourcePages ?? '—' }}</td>
               <td>
-                <button
-                  class="btn btn--ghost btn--sm"
-                  type="button"
-                  :disabled="module.courses.length === 0"
-                  @click="activeModuleCode = module.code"
-                >
-                  查看课程
-                </button>
+                <button class="btn btn--ghost btn--sm" type="button" @click="openModule(module.code)">查看课程</button>
               </td>
             </tr>
           </tbody>
@@ -142,40 +163,66 @@ onMounted(load);
       </div>
     </section>
 
-    <section v-if="activeModule" class="card">
-      <div class="card__header">
-        <h3 class="card__title">{{ activeModule.name }}（{{ activeModule.nature ?? '—' }} · {{ formatCredits(activeModule.requiredCredits) }} 学分）</h3>
-        <span class="muted small">官方页码：{{ activeModule.sourcePages ?? '—' }}</span>
-      </div>
-      <div v-if="activeModule.courses.length === 0" class="empty">
-        官方培养计划只给出该模块的学分要求，未列出课程号；具体课程见学校对应的通识课程目录。
-      </div>
-      <div v-else class="table-wrap">
-        <table class="table">
-          <thead>
-            <tr>
-              <th>课程代码</th>
-              <th>课程名称</th>
-              <th>学分</th>
-              <th>必修/选修</th>
-              <th>建议修读学年学期</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="course in activeModule.courses" :key="course.courseId">
-              <td class="mono">{{ course.code }}</td>
-              <td>{{ course.name }}</td>
-              <td>{{ formatCredits(course.credits) }}</td>
-              <td>
-                <span class="badge" :class="course.nature === '必修' ? 'badge--ok' : 'badge--muted'">
-                  {{ course.nature ?? '—' }}
-                </span>
-              </td>
-              <td>{{ course.suggestedTerm ?? '—' }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
+    <!-- 课程明细：从右侧滑出的抽屉，不再堆在页面底部 -->
+    <Teleport to="body">
+      <Transition name="drawer-fade">
+        <div v-if="drawerOpen && activeModule" class="drawer-backdrop" @click.self="closeDrawer">
+          <aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="program-drawer-title">
+            <div class="drawer__header">
+              <div class="drawer__heading">
+                <h3 id="program-drawer-title" class="drawer__title">{{ activeModule.name }}</h3>
+                <div class="drawer__subtitle">
+                  <span class="badge" :class="activeModule.nature === '必修' ? 'badge--ok' : 'badge--muted'">
+                    {{ activeModule.nature ?? '—' }}
+                  </span>
+                  <span class="badge badge--muted">{{ formatCredits(activeModule.requiredCredits) }} 学分</span>
+                  <span class="badge badge--muted">{{ activeModule.courses.length }} 门课程</span>
+                  <span v-if="activeModule.sourcePages">· 官方页码 {{ activeModule.sourcePages }}</span>
+                </div>
+              </div>
+              <button class="btn btn--ghost btn--sm" type="button" aria-label="关闭" @click="closeDrawer">关闭 ✕</button>
+            </div>
+
+            <div class="drawer__body">
+              <p v-if="activeModule.note" class="small muted" style="margin-top: 0">{{ activeModule.note }}</p>
+
+              <div v-if="activeModule.courses.length === 0" class="empty">
+                官方培养计划只给出该模块的学分要求，未列出课程号；具体课程见学校对应的通识课程目录。
+              </div>
+              <div v-else class="table-wrap">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th>课程代码</th>
+                      <th>课程名称</th>
+                      <th>学分</th>
+                      <th>必修/选修</th>
+                      <th>建议修读学年学期</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="course in activeModule.courses" :key="course.courseId">
+                      <td class="mono">{{ course.code }}</td>
+                      <td>{{ course.name }}</td>
+                      <td>{{ formatCredits(course.credits) }}</td>
+                      <td>
+                        <span class="badge" :class="course.nature === '必修' ? 'badge--ok' : 'badge--muted'">
+                          {{ course.nature ?? '—' }}
+                        </span>
+                      </td>
+                      <td>{{ course.suggestedTerm ?? '—' }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div class="drawer__footer">
+              <button class="btn btn--primary" type="button" @click="closeDrawer">知道了</button>
+            </div>
+          </aside>
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>
