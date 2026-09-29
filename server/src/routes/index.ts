@@ -298,6 +298,19 @@ function mountPreferences(app: Express): void {
     return preferenceService.validateDraft(db, studentId, batchId, payload);
   });
 
+  // 志愿预演：只读。回答“按当前名额，这些志愿排出来的课表是什么样、哪一门排不进、被谁挡住”。
+  // 不预测中签概率——统一分配还要经过需求等级、志愿排名与固定随机键的竞争。
+  handle(router, 'post', '/preview', requireAuth, async (req) => {
+    const db = req.ctx.db;
+    const studentId = resolveStudentScope(req);
+    const batchId = idParam(req.body?.batchId, 'batchId');
+    const payload = {
+      preferences: Array.isArray(req.body?.preferences) ? req.body.preferences : [],
+      groups: Array.isArray(req.body?.groups) ? req.body.groups : [],
+    };
+    return preferenceService.previewDraft(db, studentId, batchId, payload);
+  });
+
   handle(router, 'get', '/', requireAuth, async (req) => {
     const db = req.ctx.db;
     const studentId = resolveStudentScope(req);

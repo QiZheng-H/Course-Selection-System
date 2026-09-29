@@ -5,6 +5,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import request from 'supertest';
 import { authHeader, login, setupTestContext, type TestContext } from './helpers.js';
 import { USST_CS_2024_SOURCE, officialCourseCount } from '../src/db/official-plan.js';
+import { CLASS_ROSTER_STUDENTS } from '../src/db/class-roster.js';
 
 let ctx: TestContext;
 
@@ -68,7 +69,8 @@ describe('基础可用性', () => {
     // 课程全部来自官方培养计划（见 db/official-plan.ts）
     expect(courses.c).toBe(officialCourseCount());
     expect(classes.c).toBe(12);
-    expect(students.c).toBe(20);
+    // 20 名演示学生 + 随种子写入的真实班级名单（见 db/class-roster.ts）
+    expect(students.c).toBe(20 + CLASS_ROSTER_STUDENTS.length);
   });
 
   it('演示学生绑定官方培养方案，且模拟数据有明确标记', async () => {
@@ -117,7 +119,12 @@ describe('基础可用性', () => {
     const allClasses = (ctx.db.prepare('SELECT COUNT(*) AS c FROM teaching_classes').get() as { c: number }).c;
     expect(demoClasses).toBe(allClasses);
     const demoTeachers = (ctx.db.prepare('SELECT COUNT(*) AS c FROM teachers WHERE is_demo = 1').get() as { c: number }).c;
+    const rosterTeachers = (
+      ctx.db.prepare('SELECT COUNT(*) AS c FROM teachers WHERE is_demo = 0').get() as { c: number }
+    ).c;
     const allTeachers = (ctx.db.prepare('SELECT COUNT(*) AS c FROM teachers').get() as { c: number }).c;
-    expect(demoTeachers).toBe(allTeachers);
+    // 只有演示教师与名单教师两类，不允许出现来源不明的教师
+    expect(demoTeachers + rosterTeachers).toBe(allTeachers);
+    expect(rosterTeachers).toBe(1);
   });
 });
