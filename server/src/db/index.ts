@@ -12,7 +12,23 @@ import Database from 'better-sqlite3';
 import { config } from '../config.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const MIGRATIONS_DIR = path.join(here, 'migrations');
+
+/**
+ * 迁移目录解析。
+ *
+ * `tsc` 只编译 .ts，不会把 migrations/*.sql 复制到 dist/，
+ * 因此直接 `node dist/index.js`（npm start）时 dist/db/migrations 可能不存在，
+ * 会导致“新库/空库无法建表”（no such table: sessions）。
+ * 这里按顺序找：与编译产物同级的 migrations → 源码目录 src/db/migrations。
+ * 构建脚本仍会把 .sql 复制到 dist，使 dist 可独立部署；源码回退只作为兜底。
+ */
+const MIGRATIONS_DIR = (() => {
+  const candidates = [
+    path.join(here, 'migrations'),
+    path.resolve(here, '..', '..', 'src', 'db', 'migrations'),
+  ];
+  return candidates.find((dir) => fs.existsSync(dir)) ?? candidates[0];
+})();
 
 export type SqliteDb = Database.Database;
 

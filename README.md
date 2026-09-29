@@ -39,6 +39,32 @@ npm run test        # 后端自动化测试（88 个用例，每个用例独立�
 npm run demo        # 完整流程演示脚本（需要后端已启动）
 ```
 
+### 改完代码自动重建（watch）
+
+三种用法，按你的运行方式选一种：
+
+| 命令 | 做什么 | 什么时候用 |
+|---|---|---|
+| `npm run dev:server` | `tsx watch` 直接跑源码，改后端自动重启（不产出 dist） | 本机开发，配合前端 `npm run dev:web`（HMR，不需要 rebuild） |
+| `npm run watch:web` | 只监听前端：`vite build --watch` 每次改动重建 `web/dist` | **你在用 `npm run dev:server` + 3001 单端口访问**：后端自动重启、前端 dist 自动重建 |
+| `npm run watch:build` | 前后端都只重建 `dist`（`tsc -w` + `vite build --watch`），不重启任何进程 | 想持续产出构建产物，自己控制何时重启 |
+| `npm run watch:serve` | 重建前后端 `dist` + `node --watch dist/index.js` 自动重启后端 | **你在用构建产物跑（相当于自动版 `npm run build && npm start`）** |
+
+```bash
+# 最常用的两种组合
+npm run dev:server            # 终端 1：后端源码热重启（http://127.0.0.1:3001）
+npm run watch:web             # 终端 2：前端 dist 自动重建（3001 直接托管 web/dist）
+
+# 或者：一条命令跑构建产物
+npm run watch:serve           # 等价于「npm run build && npm start」的自动版
+```
+
+> 说明：
+> - `watch:web` 用 `vite build --watch`，**不跑 `vue-tsc` 类型检查**（那是 `npm run build` 的事），迭代更快；提交前跑一次 `npm run typecheck` 即可。
+> - 想换数据文件：`DB_PATH=./data/official-demo.db npm run watch:serve`。
+> - `Ctrl+C` 会结束全部子进程（`scripts/watch.mjs` 对每个子任务建独立进程组，逐个回收，不会留下占用端口的孤儿进程）。
+> - `npm run build` 会把 `src/db/migrations/*.sql` 一并复制到 `dist/`（`tsc` 不会复制非 TS 文件），因此 `node dist/index.js` 可以独立建库/迁移。
+
 > 演示数据自带一个状态为**正式受理**的选课批次（`2026-2027-1 第一轮选课（演示批次）`），
 > 所以打开页面就能直接提交志愿、冻结、试算与发布，不需要先手建批次。
 > 想要从零开始也可以在 **批次控制** 里新建，或执行 `npm run demo` 走一遍完整流程。
