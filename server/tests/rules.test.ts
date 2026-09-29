@@ -513,8 +513,9 @@ describe('志愿校验与权限', () => {
   });
 
   it('管理员授予替换授权后，学生可以按授权自动替换原课', async () => {
+    // 取演示学生（口令统一 123456）；班级名单学生的口令是本人学号，不能用于这里
     const studentRow = ctx.db
-      .prepare("SELECT user_id, student_no FROM students ORDER BY user_id DESC LIMIT 1")
+      .prepare('SELECT user_id, student_no FROM students WHERE is_demo = 1 ORDER BY user_id DESC LIMIT 1')
       .get() as { user_id: number; student_no: string };
     const cookie = (await login(ctx.app, studentRow.student_no, '123456')).cookie;
     const adminSession = await login(ctx.app, 'admin', 'admin123');

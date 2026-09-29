@@ -27,6 +27,11 @@ import {
   suggestedTermOffset,
   type OfficialCourse,
 } from './official-plan.js';
+import {
+  CLASS_ROSTER_ADMITTED_YEAR,
+  CLASS_ROSTER_STUDENTS,
+  CLASS_ROSTER_TEACHER,
+} from './class-roster.js';
 
 interface Rng {
   next(): number;
@@ -64,6 +69,8 @@ export interface SeedSummary {
   officialCourses: number;
   /** 教学班所在的演示学期 */
   term: string;
+  /** 随种子写入的真实班级名单账号数（is_demo = 0） */
+  rosterStudents: number;
 }
 
 const DAYS = [1, 2, 3, 4, 5];
@@ -140,7 +147,7 @@ export function seedDatabase(db: SqliteDb, options: SeedOptions = {}): SeedSumma
     }
     db.exec("DELETE FROM sqlite_sequence WHERE name IN ('" + tables.join("','") + "')");
 
-    // 口令哈希在数据写入时直接生成：管理员 admin/admin123，学生 学号/123456
+    // 口令哈希在数据写入时直接生成：管理员 admin/admin123，演示学生 学号/123456，名单学生 学号/本人学号
     return seedBusinessData(db, rng, {
       studentCount,
       classCount,
@@ -207,6 +214,14 @@ function seedBusinessData(
     const info = insertTeacher.run(name, '演示教师（模拟配置）', rng.pick(['教授', '副教授', '讲师']));
     teacherIds.push(Number(info.lastInsertRowid));
   }
+
+  // ---------------- 真实班级名单里的教师（is_demo = 0） ----------------
+  // 与演示教师同属 teachers 表，但来自真实名单，单独写入并留痕以便区分。
+  db.prepare('INSERT INTO teachers (name, department, title, is_demo) VALUES (?, ?, ?, 0)').run(
+    CLASS_ROSTER_TEACHER.name,
+    CLASS_ROSTER_TEACHER.department,
+    CLASS_ROSTER_TEACHER.title,
+  );
 
   // ---------------- 课程（来自官方培养计划） ----------------
   const insertCourse = db.prepare(
@@ -423,6 +438,44 @@ function seedBusinessData(
     studentIds.push(userId);
   }
 
+  // ---------------- 真实班级名单（is_demo = 0，初始口令 = 学号） ----------------
+  // 这批账号来自真实名单（见 db/class-roster.ts）。若不写进种子，别人拉代码后
+  // 库里没有这些账号，用学号登录会报「用户名或密码不正确」。
+  const rosterProgram = db.prepare('SELECT id FROM programs WHERE code = ?').get(CLASS_ROSTER_STUDENTS[0].programCode) as
+    | { id: number }
+    | undefined;
+  if (!rosterProgram) {
+    throw new Error(`班级名单绑定失败：培养方案 ${CLASS_ROSTER_STUDENTS[0].programCode} 不存在`);
+  }
+  const insertRosterStudent = db.prepare(
+    `INSERT INTO students (user_id, student_no, name, grade, major, program_id, admitted_year, expected_graduate_at, created_at, is_demo)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+  );
+  const rosterMajor = `${USST_CS_2024_SOURCE.major}`;
+  let rosterCount = 0;
+  for (const student of CLASS_ROSTER_STUDENTS) {
+    // 口令即学号：每个账号单独哈希（salt 随机），不与演示学生共用哈希
+    const userInfo = insertStudentUser.run(
+      student.studentNo,
+      hashPassword(student.studentNo),
+      student.name,
+      now,
+    );
+    const userId = Number(userInfo.lastInsertRowid);
+    insertRosterStudent.run(
+      userId,
+      student.studentNo,
+      student.name,
+      USST_CS_2024_SOURCE.grade,
+      rosterMajor,
+      rosterProgram.id,
+      CLASS_ROSTER_ADMITTED_YEAR,
+      `${CLASS_ROSTER_ADMITTED_YEAR + 4}-07-01`,
+      now,
+    );
+    rosterCount += 1;
+  }
+
   // 修读记录：按官方“建议修读学期”与当前教学阶段生成
   //   - 早于当前阶段的课程：多数已通过，少数不及格（需要补修）
   //   - 当前阶段课程：不预置，留给学生本学期规划与选课
@@ -498,6 +551,7 @@ function seedBusinessData(
     programName: `${USST_CS_2024_SOURCE.major}（${USST_CS_2024_SOURCE.grade} 级）`,
     officialCourses: USST_CS_2024_COURSES.length,
     term,
+    rosterStudents: rosterCount,
   };
 }
 
