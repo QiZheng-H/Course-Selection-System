@@ -11,7 +11,16 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import request from 'supertest';
-import { authHeader, createClassRow, login, setupBatch, setupTestContext, submitPreferences, type TestContext } from './helpers.js';
+import {
+  authHeader,
+  createClassRow,
+  login,
+  runAllocationTask,
+  setupBatch,
+  setupTestContext,
+  submitPreferences,
+  type TestContext,
+} from './helpers.js';
 
 let ctx: TestContext;
 
@@ -56,19 +65,18 @@ describe('候补排队与顺位', () => {
     // 冻结并试算：只有 1 人能选上，其余落选
     const freeze = await request(ctx.app).post(`/api/admin/batches/${batch.batchId}/freeze`).set(authHeader(batch.adminCookie)).send({});
     expect(freeze.status).toBe(200);
-    const run = await request(ctx.app)
-      .post(`/api/admin/batches/${batch.batchId}/allocate`)
-      .set(authHeader(batch.adminCookie))
-      .send({ mode: 'publish', idempotencyKey: `wl-publish-${batch.batchId}` });
-    expect(run.status, JSON.stringify(run.body)).toBe(200);
+    const run = await runAllocationTask(ctx, batch.adminCookie, batch.batchId, 'publish', {
+      idempotencyKey: `wl-publish-${batch.batchId}`,
+    });
+    expect(run.status, JSON.stringify(run.task)).toBe('published');
 
-    // 首轮落选自动进入候补
-    const enqueue = await request(ctx.app)
-      .post(`/api/admin/batches/${batch.batchId}/enqueue-waitlist`)
-      .set(authHeader(batch.adminCookie))
-      .send({ runId: run.body.data.runId });
-    expect(enqueue.status).toBe(200);
-    expect(enqueue.body.data.queued).toBeGreaterThan(0);
+    // 首轮发布时已经自动生成候补，不依赖管理员另点按钮
+    const autoQueued = (
+      ctx.db
+        .prepare("SELECT COUNT(*) AS c FROM waitlist_entries WHERE batch_id = ? AND status = 'queued'")
+        .get(batch.batchId) as { c: number }
+    ).c;
+    expect(autoQueued).toBeGreaterThan(0);
 
     // 进入候补阶段
     const toWaitlist = await request(ctx.app)
@@ -182,7 +190,7 @@ describe('候补排队与顺位', () => {
   });
 
   it('永久失效的申请会被关闭并说明原因（课程已取消）', async () => {
-    const batch = await setupBatch(ctx, { name: '候补关闭' });
+    const batch = await setupBatch(ctx, { name: '候补关闭', status: 'waitlist' });
     const now = new Date().toISOString();
     const courseId = Number(
       ctx.db
@@ -282,7 +290,7 @@ describe('候补排队与顺位', () => {
   });
 
   it('候补申请可以修改教学班偏好，退出后不再参与提升', async () => {
-    const batch = await setupBatch(ctx, { name: '候补修改与退出' });
+    const batch = await setupBatch(ctx, { name: '候补修改与退出', status: 'waitlist' });
     const now = new Date().toISOString();
     const courseId = Number(
       ctx.db

@@ -395,6 +395,7 @@ onMounted(async () => {
               <td class="mono">{{ cls.classCode }}<div v-if="cls.campus" class="small muted">{{ cls.campus }}</div></td>
               <td>
                 {{ cls.teacher ? `${cls.teacher.name}${cls.teacher.title ? `（${cls.teacher.title}）` : ''}` : '未指定' }}
+                <span v-if="cls.isDemo || cls.teacher?.isDemo" class="badge badge--muted">演示教师</span>
               </td>
               <td>
                 <div v-for="session in cls.sessions" :key="session.id" class="small">{{ session.text }}</div>

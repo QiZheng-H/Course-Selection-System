@@ -65,6 +65,80 @@ const canEdit = computed(() => {
 const totalCredits = computed(() => items.value.reduce((sum, item) => sum + (item.credits || 0), 0));
 const creditLimit = computed(() => batch.value?.creditLimit ?? validation.value?.creditPlan.creditLimit ?? null);
 
+/**
+ * 草稿与“已提交有效版本”的差异。
+ * 冻结与统一分配只采用最后一次成功提交的版本，因此必须让学生清楚看到
+ * “现在草稿里改了什么还没提交”。
+ */
+interface DraftDiffRow {
+  courseId: number;
+  courseName: string;
+  kind: 'added' | 'removed' | 'rank' | 'classes' | 'group';
+  detail: string;
+}
+
+const draftDiff = computed<{ changed: boolean; rows: DraftDiffRow[] }>(() => {
+  const submission = payload.value?.view;
+  if (!submission || submission.status !== 'submitted' || submission.items.length === 0) {
+    return { changed: false, rows: [] };
+  }
+  const submittedByCourse = new Map(submission.items.map((item) => [item.courseId, item]));
+  const draftByCourse = new Map(items.value.map((item) => [item.courseId, item]));
+  const rows: DraftDiffRow[] = [];
+
+  const nameOf = (courseId: number, fallback: string) =>
+    draftByCourse.get(courseId)?.courseName ??
+    submittedByCourse.get(courseId)?.courseName ??
+    courseCache[courseId]?.name ??
+    fallback;
+
+  for (const [courseId, item] of draftByCourse) {
+    const submitted = submittedByCourse.get(courseId);
+    if (!submitted) {
+      rows.push({ courseId, courseName: item.courseName, kind: 'added', detail: `草稿新增（排名 ${item.globalRank}）` });
+      continue;
+    }
+    if (submitted.globalRank !== item.globalRank) {
+      rows.push({
+        courseId,
+        courseName: item.courseName,
+        kind: 'rank',
+        detail: `排名 ${submitted.globalRank} → ${item.globalRank}`,
+      });
+    }
+    const submittedClasses = submitted.classChoices.map((choice) => choice.classId);
+    if (JSON.stringify(submittedClasses) !== JSON.stringify(item.classIds)) {
+      rows.push({
+        courseId,
+        courseName: item.courseName,
+        kind: 'classes',
+        detail: `教学班偏好 [${submittedClasses.join(', ') || '无'}] → [${item.classIds.join(', ') || '无'}]`,
+      });
+    }
+    const submittedGroup = submitted.groupCode ?? '';
+    const draftGroup = item.groupCode ?? '';
+    if (submittedGroup !== draftGroup) {
+      rows.push({
+        courseId,
+        courseName: item.courseName,
+        kind: 'group',
+        detail: `替代组 ${submittedGroup || '无'} → ${draftGroup || '无'}`,
+      });
+    }
+  }
+  for (const [courseId, submitted] of submittedByCourse) {
+    if (!draftByCourse.has(courseId)) {
+      rows.push({
+        courseId,
+        courseName: nameOf(courseId, submitted.courseName),
+        kind: 'removed',
+        detail: `草稿已移除（已提交版本排名 ${submitted.globalRank}）`,
+      });
+    }
+  }
+  return { changed: rows.length > 0, rows };
+});
+
 function serialize() {
   return {
     preferences: [...items.value]
@@ -516,6 +590,16 @@ onMounted(loadBatches);
         </div>
       </div>
       <p v-else class="muted">该批次还没有提交记录。填写下方草稿后点击“提交志愿”。</p>
+
+      <div v-if="draftDiff.changed" class="alert alert--warning" style="margin-top: 10px">
+        <strong>草稿与已提交版本（v{{ payload?.view.versionNo }}）不一致——未提交的修改不会参与本轮分配</strong>
+        <ul>
+          <li v-for="row in draftDiff.rows" :key="`${row.courseId}-${row.kind}`">
+            {{ row.courseName }}：{{ row.detail }}
+          </li>
+        </ul>
+        <div class="small">截止时采用最后一次成功提交的完整版本；修改后请重新提交。</div>
+      </div>
     </section>
 
     <section class="card">

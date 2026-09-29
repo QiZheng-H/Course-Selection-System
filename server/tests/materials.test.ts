@@ -221,9 +221,11 @@ describe('导入发布与资料版本', () => {
     expect(first.status).toBe(200);
 
     // 发布一次修读记录资料 → 之前的确认应当失效
+    // 课程号取自官方培养计划（种子库中的 courses.code）
+    const seededCourse = ctx.db.prepare('SELECT code FROM courses ORDER BY id LIMIT 1').get() as { code: string };
     const file = writeTemp(
       'records.csv',
-      `学号,课程号,状态,学期\n${studentRow.student_no},C0001,passed,2024-2025-1\n`,
+      `学号,课程号,状态,学期\n${studentRow.student_no},${seededCourse.code},passed,2024-2025-1\n`,
     );
     const importResponse = await request(ctx.app)
       .post('/api/admin/imports')

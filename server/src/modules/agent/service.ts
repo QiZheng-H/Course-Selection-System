@@ -25,6 +25,7 @@ import {
 } from '../rules/service.js';
 import { getSeatUsage } from '../catalog/service.js';
 import { classSessions } from '../catalog/seat-utils.js';
+import { currentStage, suggestedTermOffset } from '../../db/official-plan.js';
 
 export interface PlanItem {
   courseId: number;
@@ -38,6 +39,14 @@ export interface PlanItem {
   reasons: string[];
   /** 与已落实课表合并后的整周安排 */
   weeklyText: string[];
+  /** 官方培养方案信息：建议修读学年学期 */
+  suggestedTerm: string | null;
+  /** 官方培养方案信息：必修 / 选修 */
+  nature: string | null;
+  /** 官方培养方案信息：所属模块 */
+  moduleName: string | null;
+  /** 相对当前教学阶段的修读建议 */
+  termAdvice: string | null;
 }
 
 export interface Plan {
@@ -61,6 +70,23 @@ export interface PlanningResult {
   conflicts: ReturnType<typeof findScheduleConflicts>;
   /** 需要学生确认的项 */
   pendingConfirmations: string[];
+  /** 规划所依据的培养方案（含官方来源与页码） */
+  program: {
+    code: string;
+    name: string;
+    grade: string | null;
+    major: string | null;
+    totalCredits: number;
+    version: string;
+    sourceFile: string | null;
+    sourceUrl: string | null;
+    sourcePages: string | null;
+    sourceNote: string | null;
+  } | null;
+  /** 当前教学阶段（由学期与入学年份推算），例如 三/1 */
+  stage: string | null;
+  /** 规划所用学期 */
+  term: string;
 }
 
 export interface PlanInput {
@@ -278,6 +304,34 @@ export function buildPlans(db: SqliteDb, studentId: number, input: PlanInput, mo
   const current = loadStudentSchedule(db, studentId);
   const currentCourseIds = new Set(current.map((c) => c.courseId));
 
+  // 官方培养方案来源与当前教学阶段：Agent 只按“官方建议学期 + 个人修读记录 + 本学期开课”规划
+  const programRow = db
+    .prepare(
+      `SELECT p.code, p.name, p.grade, p.major, p.total_credits AS totalCredits, p.version,
+              p.source_file AS sourceFile, p.source_url AS sourceUrl, p.source_pages AS sourcePages, p.source_note AS sourceNote
+       FROM programs p JOIN students s ON s.program_id = p.id WHERE s.user_id = ?`,
+    )
+    .get(studentId) as
+    | {
+        code: string;
+        name: string;
+        grade: string | null;
+        major: string | null;
+        totalCredits: number;
+        version: string;
+        sourceFile: string | null;
+        sourceUrl: string | null;
+        sourcePages: string | null;
+        sourceNote: string | null;
+      }
+    | undefined;
+  const admittedYear =
+    (db.prepare('SELECT admitted_year AS admittedYear, grade FROM students WHERE user_id = ?').get(studentId) as
+      | { admittedYear: number | null; grade: string | null }
+      | undefined) ?? { admittedYear: null, grade: null };
+  const admitted = admittedYear.admittedYear ?? (admittedYear.grade ? Number.parseInt(admittedYear.grade, 10) : null);
+  const stage = admitted && Number.isFinite(admitted) ? currentStage(term, admitted) : null;
+
   // 候选课程：培养方案里尚未完成的课程 + 学生明确提到的课程
   const candidateIds = new Set<number>();
   for (const requirement of progress.requirements) {
@@ -285,7 +339,10 @@ export function buildPlans(db: SqliteDb, studentId: number, input: PlanInput, mo
     for (const courseId of requirement.candidateCourseIds) candidateIds.add(courseId);
   }
   for (const courseId of targetCourseIds) candidateIds.add(courseId);
+  // 已通过 / 正在修读 / 本学期已选的课程不再作为候选（已选不等于已通过，
+  // 但这三类都已经“有安排”，Agent 不能重复推荐同一门课）
   for (const courseId of currentCourseIds) candidateIds.delete(courseId);
+  for (const courseId of progress.arrangedCourseIds) candidateIds.delete(courseId);
 
   const candidates = Array.from(candidateIds).filter((id) => !avoidCourseIds.has(id));
   const demandMap = assessDemand(db, studentId, candidates);
@@ -294,6 +351,47 @@ export function buildPlans(db: SqliteDb, studentId: number, input: PlanInput, mo
         .prepare(`SELECT id, code, name, credits, course_type FROM courses WHERE id IN (${candidates.map(() => '?').join(',')})`)
         .all(...candidates) as Array<{ id: number; code: string; name: string; credits: number; course_type: string }>)
     : [];
+
+  // 官方培养方案明细：建议修读学期与必修/选修（优先取优先级更高的模块）
+  interface PlanInfo {
+    suggestedTerm: string | null;
+    nature: string | null;
+    moduleName: string;
+    /** 模块性质：必修 / 选修（决定是否“同类只安排一门”） */
+    moduleNature: string | null;
+    offset: number | null;
+  }
+  const planInfo = new Map<number, PlanInfo>();
+  if (courseRows.length > 0) {
+    const infoRows = db
+      .prepare(
+        `SELECT cc.course_id AS courseId, cc.suggested_term AS suggestedTerm,
+                COALESCE(cc.course_nature, cr.nature) AS nature, cr.name AS moduleName,
+                cr.nature AS moduleNature
+         FROM curriculum_courses cc
+         JOIN curriculum_requirements cr ON cr.id = cc.requirement_id
+         WHERE cc.course_id IN (${courseRows.map(() => '?').join(',')})
+           AND cr.program_id = (SELECT program_id FROM students WHERE user_id = ?)
+         ORDER BY cr.priority, cc.priority`,
+      )
+      .all(...courseRows.map((c) => c.id), studentId) as Array<{
+      courseId: number;
+      suggestedTerm: string | null;
+      nature: string | null;
+      moduleName: string;
+      moduleNature: string | null;
+    }>;
+    for (const row of infoRows) {
+      if (planInfo.has(row.courseId)) continue;
+      planInfo.set(row.courseId, {
+        suggestedTerm: row.suggestedTerm,
+        nature: row.nature,
+        moduleName: row.moduleName,
+        moduleNature: row.moduleNature,
+        offset: row.suggestedTerm ? suggestedTermOffset(row.suggestedTerm, stage) : null,
+      });
+    }
+  }
 
   const sessionMap = classSessions(
     db,
@@ -341,12 +439,24 @@ export function buildPlans(db: SqliteDb, studentId: number, input: PlanInput, mo
    * 2 备选二：同等条件下先安排学分小的课程（负担更平均）。
    */
   const orderCandidates = (variant: number) => {
+    // 修读阶段权重：本学期应修(0) → 补修(1) → 以后学期(2) → 方案外课程(3)
+    const stageRank = (courseId: number): number => {
+      const info = planInfo.get(courseId);
+      if (!info || info.offset === null) return 3;
+      if (info.offset === 0) return 0;
+      if (info.offset < 0) return 1;
+      return 2;
+    };
     return [...courseRows].sort((a, b) => {
       const demandA = DEMAND_WEIGHT[demandMap.get(a.id)?.demandLevel ?? 'D0'];
       const demandB = DEMAND_WEIGHT[demandMap.get(b.id)?.demandLevel ?? 'D0'];
       const mustA = targetCourseIds.includes(a.id) ? 0 : 1;
       const mustB = targetCourseIds.includes(b.id) ? 0 : 1;
       if (mustA !== mustB) return mustA - mustB;
+      // 先按官方培养计划的建议修读学期（本学期优先，其次补修，最后以后学期）
+      const rankA = stageRank(a.id);
+      const rankB = stageRank(b.id);
+      if (rankA !== rankB) return rankA - rankB;
       if (demandA !== demandB) return demandA - demandB;
       if (variant === 1) return b.credits - a.credits || a.code.localeCompare(b.code);
       if (variant === 2) return a.credits - b.credits || a.code.localeCompare(b.code);
@@ -397,17 +507,26 @@ export function buildPlans(db: SqliteDb, studentId: number, input: PlanInput, mo
         continue;
       }
       const requirementId = groupOfCourse.get(course.id);
-      if (requirementId !== undefined && chosenGroups.has(requirementId)) {
+      // “同一类别只安排一门”只适用于选修模块；必修模块要按培养计划把要求的课程都修完
+      const moduleIsElective = planInfo.get(course.id)?.moduleNature === '选修';
+      if (moduleIsElective && requirementId !== undefined && chosenGroups.has(requirementId)) {
         planUnmet.push({
           courseId: course.id,
           courseName: course.name,
-          reasons: ['同一需求类别已经安排了另一门课程，避免重复占用学分'],
+          reasons: ['该选修模块已经安排了另一门课程，满足最低学分即可'],
         });
         continue;
       }
       const classes = classRows.filter((c) => c.course_id === course.id);
       if (classes.length === 0) {
-        planUnmet.push({ courseId: course.id, courseName: course.name, reasons: ['本学期没有开放的教学班'] });
+        const info = planInfo.get(course.id);
+        planUnmet.push({
+          courseId: course.id,
+          courseName: course.name,
+          reasons: [
+            `本学期没有开放的教学班${info?.suggestedTerm ? `（官方培养计划建议修读 ${info.suggestedTerm}）` : ''}`,
+          ],
+        });
         continue;
       }
       let placed = false;
@@ -472,8 +591,18 @@ export function buildPlans(db: SqliteDb, studentId: number, input: PlanInput, mo
           }
         }
         credits += course.credits;
-        if (requirementId !== undefined) chosenGroups.add(requirementId);
+        if (requirementId !== undefined && moduleIsElective) chosenGroups.add(requirementId);
         const demand = demandMap.get(course.id);
+        const info = planInfo.get(course.id);
+        const termAdvice = !info?.suggestedTerm
+          ? null
+          : info.offset === null
+            ? `官方建议修读 ${info.suggestedTerm}`
+            : info.offset === 0
+              ? `官方建议修读 ${info.suggestedTerm}，与当前阶段（${stage?.label ?? '未知'}）一致`
+              : info.offset < 0
+                ? `官方建议修读 ${info.suggestedTerm}，早于当前阶段（${stage?.label ?? '未知'}），属于补修`
+                : `官方建议修读 ${info.suggestedTerm}，晚于当前阶段（${stage?.label ?? '未知'}），属于提前修读`;
         items.push({
           courseId: course.id,
           courseCode: course.code,
@@ -483,8 +612,17 @@ export function buildPlans(db: SqliteDb, studentId: number, input: PlanInput, mo
           classId: cls.id,
           classCode: cls.class_code,
           sessions: sessions.map((s) => describeSessionText(s)),
-          reasons: demand?.reasons ?? ['按额外兴趣安排'],
+          reasons: [
+            ...(info?.moduleName
+              ? [`培养方案模块「${info.moduleName}」${info.nature ? `（${info.nature}）` : ''}${termAdvice ? `：${termAdvice}` : ''}`]
+              : []),
+            ...(demand?.reasons ?? ['按额外兴趣安排']),
+          ],
           weeklyText: [],
+          suggestedTerm: info?.suggestedTerm ?? null,
+          nature: info?.nature ?? null,
+          moduleName: info?.moduleName ?? null,
+          termAdvice,
         });
         if (usage.generalAvailable <= 0 && usage.totalAvailable > 0) {
           planWarnings.push(`${course.name} ${cls.class_code} 只剩毕业保障预留名额，普通申请可能选不上`);
@@ -571,6 +709,22 @@ export function buildPlans(db: SqliteDb, studentId: number, input: PlanInput, mo
     requirements: progress.requirements,
     conflicts,
     pendingConfirmations,
+    program: programRow
+      ? {
+          code: programRow.code,
+          name: programRow.name,
+          grade: programRow.grade,
+          major: programRow.major,
+          totalCredits: programRow.totalCredits,
+          version: programRow.version,
+          sourceFile: programRow.sourceFile,
+          sourceUrl: programRow.sourceUrl,
+          sourcePages: programRow.sourcePages,
+          sourceNote: programRow.sourceNote,
+        }
+      : null,
+    stage: stage?.label ?? null,
+    term,
   };
 }
 

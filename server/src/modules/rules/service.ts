@@ -293,6 +293,8 @@ export interface RequirementProgress {
   selectedCredits: number;
   /** 已通过或正在修读（含本学期已选）已达到的总量 */
   countedCredits: number;
+  /** 已通过 + 本学期已选达到的课程门数 */
+  countedCourses: number;
   /** 还缺多少学分（>=0） */
   remainingCredits: number;
   remainingCourses: number;
@@ -306,6 +308,10 @@ export interface ProgressSnapshot {
   requirements: RequirementProgress[];
   passedCredits: number;
   selectedCredits: number;
+  /** 每门培养方案课程唯一归属的需求类别（courseId → requirementId） */
+  courseRequirement: Record<number, number>;
+  /** 冻结时已经“有安排”的课程：已通过、正在修读、本学期已选 */
+  arrangedCourseIds: number[];
 }
 
 /**
@@ -326,7 +332,7 @@ export function computeProgress(
     | undefined;
   const programId = programRow?.program_id ?? null;
   if (!programId) {
-    return { programId: null, requirements: [], passedCredits: 0, selectedCredits: 0 };
+    return { programId: null, requirements: [], passedCredits: 0, selectedCredits: 0, courseRequirement: {}, arrangedCourseIds: [] };
   }
 
   const records = db
@@ -451,6 +457,7 @@ export function computeProgress(
       inProgressCredits,
       selectedCredits,
       countedCredits,
+      countedCourses,
       remainingCredits,
       remainingCourses,
       candidateCourseIds,
@@ -460,7 +467,16 @@ export function computeProgress(
 
   const passedCredits = records.filter((r) => r.status === 'passed').reduce((sum, r) => sum + r.credits, 0);
   const selectedCredits = enrolled.reduce((sum, r) => sum + r.credits, 0);
-  return { programId, requirements, passedCredits, selectedCredits };
+  // “已有安排”只包含已通过、正在修读、本学期已选这三类真实记录。
+  // 志愿申请（plannedCourseIds）只用于规划预览，不能抵扣正式竞争中的培养缺口。
+  const arrangedCourseIds = Array.from(
+    new Set<number>([...records.map((r) => r.course_id), ...enrolled.map((r) => r.course_id)]),
+  );
+  const courseRequirement: Record<number, number> = {};
+  for (const [courseId, requirementId] of coursePrimaryRequirement) {
+    courseRequirement[courseId] = requirementId;
+  }
+  return { programId, requirements, passedCredits, selectedCredits, courseRequirement, arrangedCourseIds };
 }
 
 export interface DemandAssessment {
@@ -473,12 +489,176 @@ export interface DemandAssessment {
   graduationNecessary: boolean;
 }
 
+/** 冻结快照里的培养需求基线：只包含“已有安排”，不含任何未落实的志愿 */
+export interface RequirementBaseline {
+  requirementId: number;
+  code: string;
+  name: string;
+  category: string | null;
+  priority: number;
+  requiredCredits: number;
+  minCourses: number;
+  countedCredits: number;
+  countedCourses: number;
+  candidateCourseIds: number[];
+}
+
+/**
+ * 培养需求计算上下文。
+ * 它把“冻结时点”的全部需求信息固定下来，使分配过程可以在内存里反复重算剩余需求，
+ * 而不必（也不允许）回头读取实时变化的课程、课表或授权。
+ */
+export interface DemandContext {
+  requirements: RequirementBaseline[];
+  /** 培养方案课程 → 唯一需求类别 */
+  courseRequirement: Record<string, number>;
+  /** 课程 → 学分 */
+  courseCredits: Record<string, number>;
+  /** 冻结时已经算入 countedCredits 的课程，动态更新时据此避免重复计分 */
+  baseArrangedCourseIds: number[];
+  /** 管理员确认“本学期必须完成”的课程 */
+  forcedRequiredCourseIds: number[];
+}
+
+export function buildDemandContext(
+  db: SqliteDb,
+  studentId: number,
+  options: { plannedCourseIds?: number[]; term?: string } = {},
+): DemandContext {
+  // 注意：plannedCourseIds 只用于规划预览（例如学生端的培养进度提示）。
+  // 统一分配冻结时绝不传入志愿，否则未落实的申请会错误抵扣培养缺口。
+  const progress = computeProgress(db, studentId, { plannedCourseIds: options.plannedCourseIds, term: options.term });
+  const courseIds = new Set<number>();
+  for (const requirement of progress.requirements) {
+    for (const courseId of requirement.candidateCourseIds) courseIds.add(courseId);
+  }
+  for (const courseId of options.plannedCourseIds ?? []) courseIds.add(courseId);
+  for (const courseId of progress.arrangedCourseIds) courseIds.add(courseId);
+
+  const courseCredits: Record<string, number> = {};
+  const idList = Array.from(courseIds);
+  if (idList.length > 0) {
+    const rows = db
+      .prepare(`SELECT id, credits FROM courses WHERE id IN (${idList.map(() => '?').join(',')})`)
+      .all(...idList) as Array<{ id: number; credits: number }>;
+    for (const row of rows) courseCredits[String(row.id)] = row.credits;
+  }
+
+  const requirementFilter = options.term ? 'AND term = ?' : '';
+  const forcedRows = db
+    .prepare(`SELECT course_id FROM term_required_courses WHERE student_id = ? ${requirementFilter}`)
+    .all(...(options.term ? [studentId, options.term] : [studentId])) as Array<{ course_id: number }>;
+
+  return {
+    requirements: progress.requirements.map((r) => ({
+      requirementId: r.requirementId,
+      code: r.code,
+      name: r.name,
+      category: r.category,
+      priority: r.priority,
+      requiredCredits: r.requiredCredits,
+      minCourses: r.minCourses,
+      countedCredits: r.countedCredits,
+      countedCourses: r.countedCourses,
+      candidateCourseIds: r.candidateCourseIds,
+    })),
+    courseRequirement: Object.fromEntries(Object.entries(progress.courseRequirement).map(([k, v]) => [k, v])),
+    courseCredits,
+    baseArrangedCourseIds: [...progress.arrangedCourseIds],
+    forcedRequiredCourseIds: forcedRows.map((r) => r.course_id),
+  };
+}
+
+/**
+ * 在给定“已落实安排”下重新计算每门课程的培养需求等级。
+ * arrangedCourseIds 应当同时包含已有安排与本轮已经落实的结果；
+ * 未落实的志愿不会被计入，因此不会抵扣正式竞争中的培养缺口。
+ */
+export function computeDemandLevels(
+  context: DemandContext,
+  arrangedCourseIds: Iterable<number>,
+): Map<number, DemandAssessment> {
+  const base = new Set(context.baseArrangedCourseIds);
+  const state = new Map<number, { credits: number; courses: number }>();
+  for (const requirement of context.requirements) {
+    state.set(requirement.requirementId, {
+      credits: requirement.countedCredits,
+      courses: requirement.countedCourses,
+    });
+  }
+  for (const courseId of arrangedCourseIds) {
+    if (base.has(courseId)) continue;
+    const requirementId = context.courseRequirement[String(courseId)];
+    if (requirementId === undefined) continue;
+    const target = state.get(requirementId);
+    if (!target) continue;
+    target.credits += context.courseCredits[String(courseId)] ?? 0;
+    target.courses += 1;
+  }
+
+  const forced = new Set(context.forcedRequiredCourseIds);
+  const requirementById = new Map(context.requirements.map((r) => [r.requirementId, r]));
+  const allCourseIds = new Set<number>();
+  for (const key of Object.keys(context.courseRequirement)) allCourseIds.add(Number(key));
+  for (const courseId of forced) allCourseIds.add(courseId);
+
+  const result = new Map<number, DemandAssessment>();
+  for (const courseId of allCourseIds) {
+    const requirementId = context.courseRequirement[String(courseId)];
+    const requirement = requirementId === undefined ? undefined : requirementById.get(requirementId);
+    if (!requirement) {
+      result.set(courseId, {
+        courseId,
+        demandLevel: forced.has(courseId) ? 'D2' : 'D0',
+        reasons: forced.has(courseId)
+          ? ['管理员确认本学期必须完成，且尚无足够安排']
+          : ['不属于培养方案中的必修或类别课程，按额外兴趣处理'],
+        requirementId: null,
+        requirementName: null,
+        graduationNecessary: forced.has(courseId),
+      });
+      continue;
+    }
+    const current = state.get(requirement.requirementId) ?? { credits: 0, courses: 0 };
+    const satisfied = current.credits >= requirement.requiredCredits && current.courses >= requirement.minCourses;
+    const remainingCredits = Math.max(0, requirement.requiredCredits - current.credits);
+    if (satisfied) {
+      result.set(courseId, {
+        courseId,
+        demandLevel: 'D0',
+        reasons: [`培养需求「${requirement.name}」已满足，属于改善申请或额外兴趣`],
+        requirementId: requirement.requirementId,
+        requirementName: requirement.name,
+        graduationNecessary: false,
+      });
+      continue;
+    }
+    const level: DemandLevel = forced.has(courseId) || requirement.priority <= 1 ? 'D2' : 'D1';
+    result.set(courseId, {
+      courseId,
+      demandLevel: level,
+      reasons:
+        level === 'D2'
+          ? [
+              forced.has(courseId)
+                ? '管理员确认本学期必须完成，且尚无足够安排'
+                : `本期必须完成的正式要求「${requirement.name}」，尚缺 ${remainingCredits} 学分`,
+            ]
+          : [`可补足未完成的「${requirement.name}」，尚缺 ${remainingCredits} 学分`],
+      requirementId: requirement.requirementId,
+      requirementName: requirement.name,
+      graduationNecessary: true,
+    });
+  }
+  return result;
+}
+
 /**
  * 判断学生对某门课程的“培养需求等级”。
  *   D2：正式规则或管理员确认“本学期必须完成”，且尚无足够安排；
  *   D1：可以补足未完成的必修或类别学分，且尚无足够安排；
  *   D0：已有足够安排后的改善申请，或额外兴趣。
- * 说明：“建议本学期修读”不自动算 D2 —— D2 需要课程被标记为本期必需（见 admin 的必需课程配置）。
+ * plannedCourseIds 仅用于界面预览“如果这些课都选上会怎样”，不参与正式竞争。
  */
 export function assessDemand(
   db: SqliteDb,
@@ -486,83 +666,23 @@ export function assessDemand(
   courseIds: number[],
   options: { plannedCourseIds?: number[] } = {},
 ): Map<number, DemandAssessment> {
-  const progress = computeProgress(db, studentId, options);
   const result = new Map<number, DemandAssessment>();
   if (courseIds.length === 0) return result;
-
-  const placeholders = courseIds.map(() => '?').join(',');
-  const courseRows = db
-    .prepare(`SELECT id, name, course_type FROM courses WHERE id IN (${placeholders})`)
-    .all(...courseIds) as Array<{ id: number; name: string; course_type: string }>;
-  const courseById = new Map(courseRows.map((c) => [c.id, c]));
-
-  // 管理员确认的本期必须完成课程
-  const termRequired = new Set(
-    (
-      db
-        .prepare(
-          `SELECT cc.course_id FROM curriculum_courses cc
-           JOIN curriculum_requirements cr ON cr.id = cc.requirement_id
-           WHERE cr.program_id = (SELECT program_id FROM students WHERE user_id = ?)
-             AND cc.relation = 'direct'`,
-        )
-        .all(studentId) as Array<{ course_id: number }>
-    ).map((r) => r.course_id),
-  );
-  const forcedRequired = new Set(
-    (
-      db.prepare('SELECT course_id FROM term_required_courses WHERE student_id = ?').all(studentId) as Array<{ course_id: number }>
-    ).map((r) => r.course_id),
-  );
-
+  const context = buildDemandContext(db, studentId, { plannedCourseIds: options.plannedCourseIds });
+  const levels = computeDemandLevels(context, options.plannedCourseIds ?? []);
   for (const courseId of courseIds) {
-    const assessment: DemandAssessment = {
+    result.set(
       courseId,
-      demandLevel: 'D0',
-      reasons: [],
-      requirementId: null,
-      requirementName: null,
-      graduationNecessary: false,
-    };
-    // 管理员确认的“本学期必须完成”优先级最高：即使课程不在培养方案明细里，也按 D2 处理
-    if (forcedRequired.has(courseId)) {
-      const progressOfCourse = progress.requirements.find((r) => r.candidateCourseIds.includes(courseId));
-      assessment.demandLevel = 'D2';
-      assessment.graduationNecessary = true;
-      assessment.requirementId = progressOfCourse?.requirementId ?? null;
-      assessment.requirementName = progressOfCourse?.name ?? null;
-      assessment.reasons.push('管理员确认本学期必须完成，且尚无足够安排');
-      result.set(courseId, assessment);
-      continue;
-    }
-    const progressOfCourse = progress.requirements.find((r) => r.candidateCourseIds.includes(courseId));
-    if (!progressOfCourse) {
-      assessment.reasons.push('不属于培养方案中的必修或类别课程，按额外兴趣处理');
-      result.set(courseId, assessment);
-      continue;
-    }
-    assessment.requirementId = progressOfCourse.requirementId;
-    assessment.requirementName = progressOfCourse.name;
-
-    if (progressOfCourse.satisfied) {
-      assessment.reasons.push(`培养需求「${progressOfCourse.name}」已满足，属于改善申请或额外兴趣`);
-      result.set(courseId, assessment);
-      continue;
-    }
-
-    assessment.graduationNecessary = true;
-    const isDirect = termRequired.has(courseId);
-    if (forcedRequired.has(courseId) || (isDirect && progressOfCourse.priority <= 1)) {
-      assessment.demandLevel = 'D2';
-      assessment.reasons.push(`课程属于本期必须完成的正式要求，且「${progressOfCourse.name}」尚缺 ${progressOfCourse.remainingCredits} 学分`);
-    } else {
-      assessment.demandLevel = 'D1';
-      assessment.reasons.push(`可补足未完成的「${progressOfCourse.name}」，尚缺 ${progressOfCourse.remainingCredits} 学分`);
-    }
-    result.set(courseId, assessment);
+      levels.get(courseId) ?? {
+        courseId,
+        demandLevel: 'D0',
+        reasons: ['不属于培养方案要求，视为额外兴趣'],
+        requirementId: null,
+        requirementName: null,
+        graduationNecessary: false,
+      },
+    );
   }
-
-  void courseById;
   return result;
 }
 
@@ -610,15 +730,26 @@ export function checkGroupFulfilment(groups: SubstituteGroup[], fulfilledCourseI
 // 毕业保障的联合可行性
 // ---------------------------------------------------------------------------
 
+export interface GraduationCourseOption {
+  courseId: number;
+  courseName: string;
+  classIds: number[];
+}
+
 export interface GraduationFeasibilityInput {
   /** 每门必要课程可用的、且该学生有资格的候选教学班 */
-  courseOptions: Array<{
-    courseId: number;
-    courseName: string;
-    classIds: number[];
-  }>;
-  /** 学生已经落实、不可退出的课程（例如预分配或已选） */
+  courseOptions: GraduationCourseOption[];
+  /** 已经落实、不可退出的课程（例如预分配或已选） */
   fixedSchedule?: ClassSchedule[];
+  /**
+   * 直接提供教学班占用键（冻结快照计算用）。
+   * 传入时不再查询数据库，保证试算只依赖快照内容。
+   */
+  occupancyOf?: (classId: number) => Set<string> | undefined;
+  /** 已有课表的占用键（与 occupancyOf 搭配使用） */
+  fixedOccupancy?: Set<string>;
+  /** 班级展示名（用于异常可读性），默认查库 */
+  classCodeOf?: (classId: number) => string | undefined;
 }
 
 export interface GraduationFeasibility {
@@ -632,35 +763,56 @@ export interface GraduationFeasibility {
  * 检查“一个学生的多门必要课程”是否存在联合可行的安排。
  * 只看单门课程的总容量是不够的：不同课程可能只有同一时段的教学班，
  * 那样即使每门课都有空位，学生也永远无法同时修完。
+ *
+ * 联合匹配必须同时包含：
+ *   - 学生已经落实、不可退出的课程（fixedSchedule / fixedOccupancy）；
+ *   - 本次拟加入的课程（调用方把它并入 fixedOccupancy）；
+ *   - 全部剩余必要课程；
+ *   - 共享容量（调用方已按当前可用名额过滤 classIds）。
+ * 只验证“单人局部空课表”会把明明排不下的组合误判为可行。
  */
 export function checkGraduationFeasibility(
-  db: SqliteDb,
+  db: SqliteDb | null,
   input: GraduationFeasibilityInput,
 ): GraduationFeasibility {
-  const fixed = input.fixedSchedule ?? [];
-  const fixedCourseIds = new Set(fixed.map((f) => f.courseId));
+  const fixedSchedule = input.fixedSchedule ?? [];
+  const fixedCourseIds = new Set(fixedSchedule.map((f) => f.courseId));
   const options = input.courseOptions.filter((o) => !fixedCourseIds.has(o.courseId));
+
   const scheduleCache = new Map<number, ClassSchedule>();
-  for (const option of options) {
-    for (const classId of option.classIds) {
-      if (!scheduleCache.has(classId)) {
-        const [loaded] = loadClassSchedule(db, [classId]);
-        if (loaded) scheduleCache.set(classId, loaded);
+  const loadOne = (classId: number): ClassSchedule | undefined => {
+    if (!db) return undefined;
+    if (!scheduleCache.has(classId)) {
+      const [loaded] = loadClassSchedule(db, [classId]);
+      if (loaded) scheduleCache.set(classId, loaded);
+    }
+    return scheduleCache.get(classId);
+  };
+  const occupancyCache = new Map<number, Set<string> | undefined>();
+  const occupancyOf =
+    input.occupancyOf ??
+    ((classId: number) => {
+      if (!occupancyCache.has(classId)) {
+        const loaded = loadOne(classId);
+        occupancyCache.set(classId, loaded ? occupancyKeys(loaded.sessions) : undefined);
       }
+      return occupancyCache.get(classId);
+    });
+  const classCodeOf = input.classCodeOf ?? ((classId: number) => loadOne(classId)?.classCode);
+
+  const fixedOccupancy = new Set<string>(input.fixedOccupancy ?? []);
+  if (!input.fixedOccupancy) {
+    for (const item of fixedSchedule) {
+      for (const key of occupancyKeys(item.sessions)) fixedOccupancy.add(key);
     }
   }
 
   const assignment: Array<{ courseId: number; classId: number }> = [];
-  const chosen: ClassSchedule[] = [...fixed];
   const failureTrace: string[] = [];
+  const chosenUnion = new Set<string>(fixedOccupancy);
 
   // 按候选数量从少到多（最受限优先）贪心 + 回溯：课程数不多，开销可控
   const ordered = [...options].sort((a, b) => a.classIds.length - b.classIds.length);
-
-  const fitted = {
-    courseNames: ordered.map((o) => o.courseName),
-    messages: [] as string[],
-  };
 
   const backtrack = (index: number): boolean => {
     if (index >= ordered.length) return true;
@@ -670,18 +822,20 @@ export function checkGraduationFeasibility(
       return false;
     }
     for (const classId of option.classIds) {
-      const schedule = scheduleCache.get(classId);
-      if (!schedule) continue;
-      const conflicts = findConflicts(
-        schedule.sessions,
-        chosen.flatMap((c) => c.sessions),
-      );
-      if (conflicts.length > 0) continue;
-      chosen.push(schedule);
+      const occupancy = occupancyOf(classId);
+      if (!occupancy) continue;
+      if (keysIntersect(chosenUnion, occupancy)) continue;
+      const added: string[] = [];
+      for (const key of occupancy) {
+        if (!chosenUnion.has(key)) {
+          chosenUnion.add(key);
+          added.push(key);
+        }
+      }
       assignment.push({ courseId: option.courseId, classId });
       if (backtrack(index + 1)) return true;
-      chosen.pop();
       assignment.pop();
+      for (const key of added) chosenUnion.delete(key);
     }
     failureTrace.push(`课程「${option.courseName}」的所有候选教学班都与已安排课程冲突`);
     return false;
@@ -692,7 +846,7 @@ export function checkGraduationFeasibility(
     return { feasible: true, conflicts: [], assignment };
   }
 
-  // 失败时给出可解释的原因：找出互相冲突的课程对
+  // 失败时给出可解释的原因：找出互相“怎么选都冲突”的课程对
   const conflicts: GraduationFeasibility['conflicts'] = [];
   for (let i = 0; i < ordered.length; i += 1) {
     for (let j = i + 1; j < ordered.length; j += 1) {
@@ -701,12 +855,11 @@ export function checkGraduationFeasibility(
       const pairs: string[] = [];
       for (const classA of a.classIds) {
         for (const classB of b.classIds) {
-          const sa = scheduleCache.get(classA);
-          const sb = scheduleCache.get(classB);
-          if (!sa || !sb) continue;
-          const found = findConflicts(sa.sessions, sb.sessions);
-          if (found.length > 0) {
-            pairs.push(`${sa.classCode} 与 ${sb.classCode} 在${describeWeeks(found[0].weeks)}冲突`);
+          const oa = occupancyOf(classA);
+          const ob = occupancyOf(classB);
+          if (!oa || !ob) continue;
+          if (keysIntersect(oa, ob)) {
+            pairs.push(`${classCodeOf(classA) ?? classA} 与 ${classCodeOf(classB) ?? classB} 时间冲突`);
           }
         }
       }
@@ -729,7 +882,7 @@ export function checkGraduationFeasibility(
         : [
             {
               courseIds: ordered.map((o) => o.courseId),
-              courseNames: fitted.courseNames,
+              courseNames: ordered.map((o) => o.courseName),
               messages: failureTrace.slice(0, 5),
             },
           ],

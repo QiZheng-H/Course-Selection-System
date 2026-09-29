@@ -1,13 +1,32 @@
 /**
  * 演示数据生成。
  *
- * 规模按验收要求默认 100 名学生、50 个教学班，
- * 数据里刻意包含：单双周课程、多时段课程、互斥替代组、毕业必要课程、预分配占用。
- * 通过固定随机种子生成，保证每次 `db:reset` 得到同样的数据，方便演示与测试。
+ * 培养方案来自官方文件（见 db/official-plan.ts 与 docs/培养方案来源核对.md）：
+ *   上海理工大学 计算机科学与技术（080901 / 培养计划编号 1208），2024 级本科生。
+ *   课程代码、名称、学分、必修选修属性、类别学分要求与建议修读学年学期均照抄官方表格。
+ *
+ * 明确标记为演示数据的部分：
+ *   - 教师姓名 / 职称 / 院系
+ *   - 教学班编号、上课时间、教室、容量与毕业预留
+ *   - 学生账号、修读记录、预分配记录
+ * 这些数据在库里有 is_demo 标记，课程描述里也会写明。
+ *
+ * 规模按验收要求默认 100 名学生、50 个教学班；通过固定随机种子生成，
+ * 保证每次 `db:reset` 得到同样的数据，方便演示与测试。
  */
 import type { SqliteDb } from './index.js';
 import { nowIso, sha256, stableStringify } from '../core/utils.js';
 import { hashPassword } from '../core/password.js';
+import {
+  DEMO_DATA_NOTICE,
+  USST_CS_2024_COURSES,
+  USST_CS_2024_MODULES,
+  USST_CS_2024_SOURCE,
+  currentStage,
+  parseSuggestedTerm,
+  suggestedTermOffset,
+  type OfficialCourse,
+} from './official-plan.js';
 
 interface Rng {
   next(): number;
@@ -38,6 +57,13 @@ export interface SeedSummary {
   preallocations: number;
   /** 演示数据自带的选课批次（状态 open，可直接提交志愿） */
   batchId: number;
+  /** 绑定的官方培养方案 */
+  programCode: string;
+  programName: string;
+  /** 官方课程门数（有课程号的） */
+  officialCourses: number;
+  /** 教学班所在的演示学期 */
+  term: string;
 }
 
 const DAYS = [1, 2, 3, 4, 5];
@@ -54,6 +80,9 @@ export interface SeedOptions {
   classCount?: number;
   adminPassword?: string;
   studentPassword?: string;
+  /** 教学班所在学期（同时决定学生的当前教学阶段） */
+  term?: string;
+  admittedYear?: number;
 }
 
 export function seedDatabase(db: SqliteDb, options: SeedOptions = {}): SeedSummary {
@@ -61,16 +90,20 @@ export function seedDatabase(db: SqliteDb, options: SeedOptions = {}): SeedSumma
   const classCount = options.classCount ?? 50;
   const adminPassword = options.adminPassword ?? 'admin123';
   const studentPassword = options.studentPassword ?? '123456';
-  const rng = makeRng('course-selection-demo-v1');
+  const term = options.term ?? '2026-2027-1';
+  const admittedYear = options.admittedYear ?? Number(USST_CS_2024_SOURCE.grade);
+  const rng = makeRng('course-selection-demo-v2');
   const now = nowIso();
 
   return db.transaction(() => {
     // 清空业务数据（保留结构），方便重复执行
     const tables = [
+      'background_tasks',
       'exceptions',
       'audit_logs',
       'enrollment_operations',
       'waitlist_entries',
+      'guarantee_authorizations',
       'upgrade_authorizations',
       'graduation_reservations',
       'enrollments',
@@ -80,6 +113,7 @@ export function seedDatabase(db: SqliteDb, options: SeedOptions = {}): SeedSumma
       'preference_groups',
       'preferences',
       'preference_submissions',
+      'preference_drafts',
       'allocation_items',
       'allocation_runs',
       'batch_snapshots',
@@ -107,7 +141,15 @@ export function seedDatabase(db: SqliteDb, options: SeedOptions = {}): SeedSumma
     db.exec("DELETE FROM sqlite_sequence WHERE name IN ('" + tables.join("','") + "')");
 
     // 口令哈希在数据写入时直接生成：管理员 admin/admin123，学生 学号/123456
-    return seedBusinessData(db, rng, { studentCount, classCount, now, adminPassword, studentPassword });
+    return seedBusinessData(db, rng, {
+      studentCount,
+      classCount,
+      now,
+      adminPassword,
+      studentPassword,
+      term,
+      admittedYear,
+    });
   })();
 }
 
@@ -115,9 +157,17 @@ export function seedDatabase(db: SqliteDb, options: SeedOptions = {}): SeedSumma
 function seedBusinessData(
   db: SqliteDb,
   rng: Rng,
-  ctx: { studentCount: number; classCount: number; now: string; adminPassword: string; studentPassword: string },
+  ctx: {
+    studentCount: number;
+    classCount: number;
+    now: string;
+    adminPassword: string;
+    studentPassword: string;
+    term: string;
+    admittedYear: number;
+  },
 ): SeedSummary {
-  const { studentCount, classCount, now, adminPassword, studentPassword } = ctx;
+  const { studentCount, classCount, now, adminPassword, studentPassword, term, admittedYear } = ctx;
 
   // ---------------- 管理员 ----------------
   db.prepare(
@@ -132,6 +182,13 @@ function seedBusinessData(
     ['public_supplement_enabled', 'true', 'boolean', '是否允许在无合格候补时公开补选'],
     ['class_swap_enabled', 'true', 'boolean', '是否允许同课换班'],
     ['agent_online_enabled', 'false', 'boolean', '是否启用在线模型（默认关闭，使用离线备用）'],
+    [
+      'current_term',
+      term,
+      'string',
+      `演示学期：教学班与“本学期开课”按该学期模拟；学生当前教学阶段由入学年份 ${admittedYear} 与学期推算`,
+    ],
+    ['demo_data_notice', DEMO_DATA_NOTICE, 'string', '演示数据说明（课程来自官方培养计划，教学班与教师为模拟配置）'],
   ];
   const insertConfig = db.prepare(
     'INSERT INTO app_configs (key, value, value_type, description, updated_at) VALUES (?, ?, ?, ?, ?)',
@@ -140,103 +197,98 @@ function seedBusinessData(
     insertConfig.run(key, value, type, desc, now);
   }
 
-  // ---------------- 教师 ----------------
+  // ---------------- 教师（演示数据） ----------------
   const surnames = ['张', '李', '王', '刘', '陈', '杨', '赵', '黄', '周', '吴', '徐', '孙', '马', '朱', '胡'];
   const given = ['明', '华', '强', '敏', '静', '磊', '洋', '勇', '艳', '杰', '涛', '霞', '军', '丽', '鹏'];
-  const departments = ['计算机学院', '数学学院', '外国语学院', '经济管理学院', '物理学院', '马克思主义学院'];
-  const insertTeacher = db.prepare('INSERT INTO teachers (name, department, title) VALUES (?, ?, ?)');
+  const insertTeacher = db.prepare('INSERT INTO teachers (name, department, title, is_demo) VALUES (?, ?, ?, 1)');
   const teacherIds: number[] = [];
   for (let i = 0; i < 40; i += 1) {
     const name = `${rng.pick(surnames)}${rng.pick(given)}`;
-    const info = insertTeacher.run(name, rng.pick(departments), rng.pick(['教授', '副教授', '讲师']));
+    const info = insertTeacher.run(name, '演示教师（模拟配置）', rng.pick(['教授', '副教授', '讲师']));
     teacherIds.push(Number(info.lastInsertRowid));
   }
 
-  // ---------------- 课程 ----------------
+  // ---------------- 课程（来自官方培养计划） ----------------
   const insertCourse = db.prepare(
-    `INSERT INTO courses (code, name, credits, department, course_type, description, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO courses (code, name, credits, department, course_type, description, created_at, is_demo)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const insertSession = db.prepare(
     `INSERT INTO class_sessions (class_id, day_of_week, period_start, period_end, week_start, week_end, week_parity, room)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const insertClass = db.prepare(
-    `INSERT INTO teaching_classes (course_id, class_code, term, teacher_id, capacity, reserved_seats, status, campus, note, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)`,
+    `INSERT INTO teaching_classes (course_id, class_code, term, teacher_id, capacity, reserved_seats, status, campus, note, created_at, is_demo)
+     VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, 1)`,
   );
 
-  const term = '2026-2027-1';
+  const departmentByModule = new Map(USST_CS_2024_MODULES.map((m) => [m.code, m.department]));
+  const moduleNameByModule = new Map(USST_CS_2024_MODULES.map((m) => [m.code, `${m.group}·${m.name}`]));
+
   const courseIds: number[] = [];
-  const requiredCourses: number[] = [];
-
-  const catalogue: Array<{ name: string; credits: number; type: 'required' | 'limited_elective' | 'elective' | 'general'; dept: string }> = [
-    { name: '高等数学A', credits: 5, type: 'required', dept: '数学学院' },
-    { name: '线性代数', credits: 3, type: 'required', dept: '数学学院' },
-    { name: '概率论与数理统计', credits: 3, type: 'required', dept: '数学学院' },
-    { name: '大学物理', credits: 4, type: 'required', dept: '物理学院' },
-    { name: '程序设计基础', credits: 4, type: 'required', dept: '计算机学院' },
-    { name: '数据结构', credits: 4, type: 'required', dept: '计算机学院' },
-    { name: '计算机组成原理', credits: 4, type: 'required', dept: '计算机学院' },
-    { name: '操作系统', credits: 4, type: 'required', dept: '计算机学院' },
-    { name: '数据库系统原理', credits: 3, type: 'required', dept: '计算机学院' },
-    { name: '计算机网络', credits: 3, type: 'required', dept: '计算机学院' },
-    { name: '软件工程', credits: 3, type: 'required', dept: '计算机学院' },
-    { name: '编译原理', credits: 3, type: 'limited_elective', dept: '计算机学院' },
-    { name: '人工智能导论', credits: 3, type: 'limited_elective', dept: '计算机学院' },
-    { name: '机器学习', credits: 3, type: 'limited_elective', dept: '计算机学院' },
-    { name: 'Web 应用开发', credits: 3, type: 'limited_elective', dept: '计算机学院' },
-    { name: '信息安全基础', credits: 3, type: 'limited_elective', dept: '计算机学院' },
-    { name: '离散数学', credits: 3, type: 'required', dept: '数学学院' },
-    { name: '数值分析', credits: 3, type: 'limited_elective', dept: '数学学院' },
-    { name: '大学英语', credits: 3, type: 'required', dept: '外国语学院' },
-    { name: '学术英语写作', credits: 2, type: 'general', dept: '外国语学院' },
-    { name: '微观经济学', credits: 3, type: 'general', dept: '经济管理学院' },
-    { name: '管理学原理', credits: 3, type: 'general', dept: '经济管理学院' },
-    { name: '中国近现代史纲要', credits: 3, type: 'required', dept: '马克思主义学院' },
-    { name: '马克思主义基本原理', credits: 3, type: 'required', dept: '马克思主义学院' },
-    { name: '体育（一）', credits: 1, type: 'required', dept: '体育部' },
-    { name: '艺术鉴赏', credits: 2, type: 'general', dept: '艺术学院' },
-    { name: '科技写作', credits: 2, type: 'general', dept: '文学院' },
-    { name: '数据可视化', credits: 2, type: 'elective', dept: '计算机学院' },
-  ];
-
-  catalogue.forEach((item, idx) => {
-    const code = `C${String(idx + 1).padStart(4, '0')}`;
+  const courseIdByCode = new Map<string, number>();
+  const officialByCode = new Map<string, OfficialCourse & { moduleCode: string }>();
+  for (const course of USST_CS_2024_COURSES) {
+    officialByCode.set(course.code, course);
     const info = insertCourse.run(
-      code,
-      item.name,
-      item.credits,
-      item.dept,
-      item.type,
-      `${item.name}（${item.credits} 学分，${item.type === 'required' ? '必修' : item.type === 'limited_elective' ? '限选' : item.type === 'general' ? '通识' : '任选'}）`,
+      course.code,
+      course.name,
+      course.credits,
+      departmentByModule.get(course.moduleCode) ?? null,
+      course.courseType,
+      `官方培养计划课程（${moduleNameByModule.get(course.moduleCode) ?? course.moduleCode}，建议修读 ${course.suggestedTerm}，${course.nature}）。${DEMO_DATA_NOTICE}`,
       now,
+      0,
     );
     const id = Number(info.lastInsertRowid);
     courseIds.push(id);
-    if (item.type === 'required' && item.credits >= 3) requiredCourses.push(id);
-  });
+    courseIdByCode.set(course.code, id);
+  }
 
-  // 教学班：50 个，覆盖 28 门课，其中毕业必要课程给 3 个班（体现“名额紧张”）
+  // ---------------- 教学班（演示数据：时间/容量/教师均为模拟配置） ----------------
+  const stage = currentStage(term, admittedYear);
+  const offsetOf = (course: OfficialCourse) => suggestedTermOffset(course.suggestedTerm, stage);
+  const currentStageCourses = USST_CS_2024_COURSES.filter((c) => offsetOf(c) === 0).map((c) => courseIdByCode.get(c.code)!);
+  const previousStageCourses = USST_CS_2024_COURSES.filter((c) => offsetOf(c) === -1).map((c) => courseIdByCode.get(c.code)!);
+  const highCreditRequired = USST_CS_2024_COURSES.filter((c) => c.courseType === 'required' && c.credits >= 4).map(
+    (c) => courseIdByCode.get(c.code)!,
+  );
+
+  // 必须开班的课程：官方顺序最前面的几门（保证通用检索/测试拿到有班课程）、
+  // 高学分必修课、本学期（当前阶段）与上一阶段课程（补修用）。
+  const mustHaveIds = Array.from(
+    new Set<number>([
+      ...courseIds.slice(0, 6),
+      ...highCreditRequired,
+      ...currentStageCourses,
+      ...previousStageCourses,
+    ]),
+  );
+  const priorityOrder = Array.from(
+    new Set<number>([
+      ...mustHaveIds,
+      ...USST_CS_2024_COURSES.filter((c) => c.courseType === 'required').map((c) => courseIdByCode.get(c.code)!),
+      ...courseIds,
+    ]),
+  );
+
   const classCourseIds: number[] = [];
-  const requiredWithMoreClasses = [courseIds[0], courseIds[4], courseIds[5], courseIds[6], courseIds[8], courseIds[22]];
-  for (const cid of requiredWithMoreClasses) {
-    classCourseIds.push(cid, cid, cid);
+  for (const courseId of priorityOrder) {
+    if (classCourseIds.length >= classCount) break;
+    classCourseIds.push(courseId);
   }
-  let cursor = 0;
+  // 还有余量：优先给必修课增加第二个班，制造“热门课名额紧张”的演示效果
+  let extraCursor = 0;
   while (classCourseIds.length < classCount) {
-    const cid = courseIds[cursor % courseIds.length];
-    cursor += 1;
-    // 必修课排完后再补充其它课程，避免同一门课班次过多
-    const occurrences = classCourseIds.filter((c) => c === cid).length;
-    if (occurrences >= 3) continue;
-    classCourseIds.push(cid);
+    const courseId = priorityOrder[extraCursor % priorityOrder.length];
+    extraCursor += 1;
+    if (classCourseIds.filter((c) => c === courseId).length >= 2) continue;
+    classCourseIds.push(courseId);
+    if (extraCursor > priorityOrder.length * 4) break;
   }
-  const limitedClassCourses = classCourseIds.slice(0, classCount);
 
   const classIds: number[] = [];
-  const occupiedSlots = new Map<string, number>();
-  limitedClassCourses.forEach((courseId, idx) => {
+  classCourseIds.forEach((courseId, idx) => {
     const classCode = `${term.replace(/-/g, '')}-${String(idx + 1).padStart(3, '0')}`;
     const capacity = rng.int(30, 70);
     // 每个教学班预留 0-4 个毕业保障名额
@@ -250,13 +302,13 @@ function seedBusinessData(
       capacity,
       Math.min(reserved, capacity - 5),
       rng.pick(['东校区', '西校区']),
-      idx % 7 === 0 ? '含实验环节' : null,
+      idx % 7 === 0 ? '【演示数据】含实验环节；教师与容量为模拟配置' : '【演示数据】教师与容量为模拟配置',
       now,
     );
     const classId = Number(info.lastInsertRowid);
     classIds.push(classId);
 
-    // 时段：1-3 个时段；每 5 个班出现一个单双周班
+    // 时段：1-3 个时段；每 5 个班出现一个单双周班（演示模拟配置）
     const sessionCount = rng.int(1, 3);
     const usedKeys = new Set<string>();
     for (let s = 0; s < sessionCount; s += 1) {
@@ -275,223 +327,143 @@ function seedBusinessData(
         day,
         period[0],
         period[1],
-        parity === 'all' ? 1 : 1,
-        parity === 'all' ? 16 : 16,
+        1,
+        16,
         parity,
         `教${rng.int(1, 6)}-${rng.int(100, 499)}`,
       );
-      occupiedSlots.set(`${classId}-${day}-${period[0]}`, classId);
     }
   });
 
-  // ---------------- 培养方案 ----------------
+  // ---------------- 培养方案（官方文件） ----------------
   const insertProgram = db.prepare(
-    `INSERT INTO programs (code, name, grade, major, total_credits, version, published_at, status, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'published', ?)`,
+    `INSERT INTO programs
+     (code, name, grade, major, total_credits, version, published_at, status, created_at,
+      source_file, source_url, source_pages, source_sha256, source_note)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'published', ?, ?, ?, ?, ?, ?)`,
   );
-  const programInfo = insertProgram.run('CS-2024', '计算机科学与技术（2024 级）', '2024', '计算机科学与技术', 160, 'v1', now, now);
+  const programInfo = insertProgram.run(
+    USST_CS_2024_SOURCE.majorCode,
+    `${USST_CS_2024_SOURCE.major}（${USST_CS_2024_SOURCE.grade} 级）`,
+    USST_CS_2024_SOURCE.grade,
+    USST_CS_2024_SOURCE.major,
+    USST_CS_2024_SOURCE.totalCredits,
+    '2024版',
+    now,
+    now,
+    USST_CS_2024_SOURCE.documentTitle,
+    USST_CS_2024_SOURCE.fileUrl,
+    `${USST_CS_2024_SOURCE.planPages}；学分结构 ${USST_CS_2024_SOURCE.creditStructurePages}；通识教育课程 ${USST_CS_2024_SOURCE.generalEducationPages}`,
+    USST_CS_2024_SOURCE.fileSha256,
+    `${USST_CS_2024_SOURCE.note} 公开页：${USST_CS_2024_SOURCE.disclosurePage}`,
+  );
   const programId = Number(programInfo.lastInsertRowid);
 
   const insertRequirement = db.prepare(
-    `INSERT INTO curriculum_requirements (program_id, code, name, category, required_credits, min_courses, priority, note)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO curriculum_requirements (program_id, code, name, category, required_credits, min_courses, priority, note, nature, source_pages)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const insertCurriculumCourse = db.prepare(
-    'INSERT INTO curriculum_courses (requirement_id, course_id, relation, priority) VALUES (?, ?, ?, ?)',
+    'INSERT INTO curriculum_courses (requirement_id, course_id, relation, priority, suggested_term, course_nature) VALUES (?, ?, ?, ?, ?, ?)',
   );
 
-  const requirementDefs: Array<{
-    code: string;
-    name: string;
-    category: string;
-    credits: number;
-    minCourses: number;
-    priority: number;
-    courses: Array<{ name: string; relation: 'direct' | 'substitute' }>;
-  }> = [
-    {
-      code: 'REQ-MATH',
-      name: '数学与自然科学基础',
-      category: '必修',
-      credits: 14,
-      minCourses: 3,
-      priority: 1,
-      courses: [
-        { name: '高等数学A', relation: 'direct' },
-        { name: '线性代数', relation: 'direct' },
-        { name: '概率论与数理统计', relation: 'direct' },
-        { name: '离散数学', relation: 'direct' },
-        { name: '数值分析', relation: 'substitute' },
-      ],
-    },
-    {
-      code: 'REQ-CORE',
-      name: '专业核心课程',
-      category: '必修',
-      credits: 22,
-      minCourses: 5,
-      priority: 1,
-      courses: [
-        { name: '程序设计基础', relation: 'direct' },
-        { name: '数据结构', relation: 'direct' },
-        { name: '计算机组成原理', relation: 'direct' },
-        { name: '操作系统', relation: 'direct' },
-        { name: '数据库系统原理', relation: 'direct' },
-        { name: '计算机网络', relation: 'direct' },
-        { name: '软件工程', relation: 'direct' },
-      ],
-    },
-    {
-      code: 'REQ-ELEC',
-      name: '专业限选课程',
-      category: '限选',
-      credits: 9,
-      minCourses: 3,
-      priority: 2,
-      courses: [
-        { name: '编译原理', relation: 'direct' },
-        { name: '人工智能导论', relation: 'direct' },
-        { name: '机器学习', relation: 'direct' },
-        { name: 'Web 应用开发', relation: 'direct' },
-        { name: '信息安全基础', relation: 'direct' },
-        { name: '数据可视化', relation: 'substitute' },
-      ],
-    },
-    {
-      code: 'REQ-LANG',
-      name: '外语能力',
-      category: '必修',
-      credits: 3,
-      minCourses: 1,
-      priority: 2,
-      courses: [
-        { name: '大学英语', relation: 'direct' },
-        { name: '学术英语写作', relation: 'substitute' },
-      ],
-    },
-    {
-      code: 'REQ-IDEO',
-      name: '思想政治理论',
-      category: '必修',
-      credits: 6,
-      minCourses: 2,
-      priority: 2,
-      courses: [
-        { name: '中国近现代史纲要', relation: 'direct' },
-        { name: '马克思主义基本原理', relation: 'direct' },
-      ],
-    },
-    {
-      code: 'REQ-GEN',
-      name: '通识与体育',
-      category: '通识',
-      credits: 9,
-      minCourses: 3,
-      priority: 3,
-      courses: [
-        { name: '体育（一）', relation: 'direct' },
-        { name: '艺术鉴赏', relation: 'direct' },
-        { name: '科技写作', relation: 'direct' },
-        { name: '微观经济学', relation: 'direct' },
-        { name: '管理学原理', relation: 'direct' },
-      ],
-    },
-  ];
-
-  const courseIdByName = new Map<string, number>();
-  const courseRows = db.prepare('SELECT id, name FROM courses').all() as Array<{ id: number; name: string }>;
-  for (const row of courseRows) courseIdByName.set(row.name, row.id);
-  const courseNameById = new Map<number, string>();
-  for (const row of courseRows) courseNameById.set(row.id, row.name);
-
-  const requirementIds: number[] = [];
-  const requirementCourseMap = new Map<number, Array<{ courseId: number; name: string; relation: 'direct' | 'substitute' }>>();
-  for (const def of requirementDefs) {
+  for (const module of USST_CS_2024_MODULES) {
     const info = insertRequirement.run(
       programId,
-      def.code,
-      def.name,
-      def.category,
-      def.credits,
-      def.minCourses,
-      def.priority,
-      null,
+      module.code,
+      module.name,
+      module.group,
+      module.minCredits,
+      0,
+      module.priority,
+      module.note,
+      module.nature,
+      module.sourcePages,
     );
-    const reqId = Number(info.lastInsertRowid);
-    requirementIds.push(reqId);
-    const list: Array<{ courseId: number; name: string; relation: 'direct' | 'substitute' }> = [];
-    def.courses.forEach((c, i) => {
-      const courseId = courseIdByName.get(c.name);
+    const requirementId = Number(info.lastInsertRowid);
+    module.courses.forEach((course, index) => {
+      const courseId = courseIdByCode.get(course.code);
       if (!courseId) return;
-      insertCurriculumCourse.run(reqId, courseId, c.relation, i + 1);
-      list.push({ courseId, name: c.name, relation: c.relation });
+      insertCurriculumCourse.run(requirementId, courseId, 'direct', index + 1, course.suggestedTerm, course.nature);
     });
-    requirementCourseMap.set(reqId, list);
   }
 
-  // ---------------- 学生 ----------------
+  // ---------------- 学生（演示账号，绑定该官方培养方案） ----------------
   const insertStudentUser = db.prepare(
     `INSERT INTO users (username, password_hash, display_name, role, status, created_at, last_login_at)
      VALUES (?, ?, ?, 'student', 'active', ?, NULL)`,
   );
   const insertStudent = db.prepare(
-    `INSERT INTO students (user_id, student_no, name, grade, major, program_id, admitted_year, expected_graduate_at, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO students (user_id, student_no, name, grade, major, program_id, admitted_year, expected_graduate_at, created_at, is_demo)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
   );
   const insertRecord = db.prepare(
-    `INSERT INTO student_course_records (student_id, course_id, status, term, credits, source, verified, version_id, updated_at)
-     VALUES (?, ?, ?, ?, ?, 'school', 1, NULL, ?)`,
+    `INSERT INTO student_course_records (student_id, course_id, status, term, credits, source, verified, version_id, updated_at, is_demo)
+     VALUES (?, ?, ?, ?, ?, 'school', 1, NULL, ?, 1)`,
   );
 
   const studentIds: number[] = [];
-  const studentNos: string[] = [];
   const studentHash = hashPassword(studentPassword);
   for (let i = 0; i < studentCount; i += 1) {
-    const no = `2024${String(1001 + i).padStart(4, '0')}`;
-    studentNos.push(no);
+    const no = `${admittedYear}${String(1001 + i).padStart(4, '0')}`;
     const name = `${rng.pick(surnames)}${rng.pick(given)}${rng.bool(0.3) ? rng.pick(given) : ''}`;
     const userInfo = insertStudentUser.run(no, studentHash, name, now);
     const userId = Number(userInfo.lastInsertRowid);
-    insertStudent.run(userId, no, name, '2024', '计算机科学与技术', programId, 2024, '2028-07-01', now);
+    insertStudent.run(
+      userId,
+      no,
+      name,
+      USST_CS_2024_SOURCE.grade,
+      USST_CS_2024_SOURCE.major,
+      programId,
+      admittedYear,
+      `${admittedYear + 4}-07-01`,
+      now,
+    );
     studentIds.push(userId);
   }
 
-  // 修读记录：随机一部分课程已通过 / 正在修读
+  // 修读记录：按官方“建议修读学期”与当前教学阶段生成
+  //   - 早于当前阶段的课程：多数已通过，少数不及格（需要补修）
+  //   - 当前阶段课程：不预置，留给学生本学期规划与选课
+  const academicTermOf = (course: OfficialCourse): string => {
+    const parsed = parseSuggestedTerm(course.suggestedTerm);
+    if (!parsed) return `${admittedYear}-${admittedYear + 1}-1`;
+    const startYear = admittedYear + parsed.year - 1;
+    return `${startYear}-${startYear + 1}-${parsed.term}`;
+  };
   let recordCount = 0;
   for (const studentId of studentIds) {
-    for (const courseId of courseIds) {
+    for (const course of USST_CS_2024_COURSES) {
+      const offset = suggestedTermOffset(course.suggestedTerm, stage);
+      if (offset === null || offset >= 0) continue;
       const roll = rng.next();
-      const credits = (db.prepare('SELECT credits FROM courses WHERE id = ?').get(courseId) as { credits: number }).credits;
-      if (roll < 0.18) {
-        insertRecord.run(studentId, courseId, 'passed', rng.pick(['2024-2025-1', '2024-2025-2', '2025-2026-1', '2025-2026-2']), credits, now);
+      if (roll < 0.82) {
+        insertRecord.run(studentId, courseIdByCode.get(course.code)!, 'passed', academicTermOf(course), course.credits, now);
         recordCount += 1;
-      } else if (roll < 0.24) {
-        insertRecord.run(studentId, courseId, 'in_progress', '2026-2027-1', credits, now);
-        recordCount += 1;
-      } else if (roll < 0.28) {
-        insertRecord.run(studentId, courseId, 'failed', '2025-2026-2', 0, now);
+      } else if (roll < 0.9) {
+        insertRecord.run(studentId, courseIdByCode.get(course.code)!, 'failed', academicTermOf(course), 0, now);
         recordCount += 1;
       }
     }
   }
 
-  // ---------------- 专业课预分配（占用正式容量） ----------------
+  // ---------------- 专业课预分配（演示数据，待管理员落实） ----------------
   const insertPrealloc = db.prepare(
     `INSERT INTO preallocation_results (student_id, class_id, batch_id, status, margin, created_at, applied_at)
-     VALUES (?, ?, NULL, 'applied', ?, ?, ?)`,
+     VALUES (?, ?, NULL, 'pending', ?, ?, NULL)`,
   );
-  // 为 30 名学生预分配高数/程序设计等专业课
-  const preallocCourses = [courseIds[0], courseIds[4], courseIds[5]];
+  const preallocCourseIds = currentStageCourses.slice(0, 3);
   let preallocCount = 0;
-  for (let i = 0; i < Math.min(30, studentIds.length); i += 1) {
+  for (let i = 0; i < Math.min(30, studentIds.length) && preallocCourseIds.length > 0; i += 1) {
     const studentId = studentIds[i];
-    const courseId = preallocCourses[i % preallocCourses.length];
+    const courseId = preallocCourseIds[i % preallocCourseIds.length];
     const candidates = db
       .prepare('SELECT id, capacity, reserved_seats FROM teaching_classes WHERE course_id = ? AND status = ?')
       .all(courseId, 'open') as Array<{ id: number; capacity: number; reserved_seats: number }>;
     if (candidates.length === 0) continue;
     const target = candidates[i % candidates.length];
-    insertPrealloc.run(studentId, target.id, 2, now, now);
+    insertPrealloc.run(studentId, target.id, 2, now);
     preallocCount += 1;
   }
 
@@ -510,7 +482,7 @@ function seedBusinessData(
       `${term} 第一轮选课（演示批次）`,
       openAt,
       closeAt,
-      '演示数据自带的批次：可以直接提交志愿、冻结、试算与发布',
+      `演示数据自带的批次：${DEMO_DATA_NOTICE}`,
       now,
     );
   const batchId = Number(batchInfo.lastInsertRowid);
@@ -522,6 +494,10 @@ function seedBusinessData(
     records: recordCount,
     preallocations: preallocCount,
     batchId,
+    programCode: USST_CS_2024_SOURCE.majorCode,
+    programName: `${USST_CS_2024_SOURCE.major}（${USST_CS_2024_SOURCE.grade} 级）`,
+    officialCourses: USST_CS_2024_COURSES.length,
+    term,
   };
 }
 
@@ -531,8 +507,10 @@ export function seedFingerprint(db: SqliteDb): string {
     .prepare(
       `SELECT (SELECT COUNT(*) FROM courses) AS courses,
               (SELECT COUNT(*) FROM teaching_classes) AS classes,
-              (SELECT COUNT(*) FROM students) AS students`,
+              (SELECT COUNT(*) FROM students) AS students,
+              (SELECT COUNT(*) FROM curriculum_requirements) AS requirements,
+              (SELECT COUNT(*) FROM curriculum_courses) AS planCourses`,
     )
-    .get() as { courses: number; classes: number; students: number };
+    .get() as { courses: number; classes: number; students: number; requirements: number; planCourses: number };
   return sha256(stableStringify(counts));
 }

@@ -10,6 +10,8 @@ import type {
   BatchDto,
   ClassDto,
   CourseDto,
+  EnrolledRow,
+  GuaranteeAuthorizationRow,
   TimelineEvent,
   WaitlistEntry,
   WaitlistPayload,
@@ -46,7 +48,24 @@ const queue = ref<WaitlistQueuePayload | null>(null);
 const queueCourseName = ref('');
 
 const authorizations = ref<AuthorizationRow[]>([]);
+const guaranteeAuthorizations = ref<GuaranteeAuthorizationRow[]>([]);
 const timeline = ref<TimelineEvent[]>([]);
+
+/** 学生本人创建替换授权：原教学班取自已选课程，目标课程可指定教学班 */
+const enrolled = ref<EnrolledRow[]>([]);
+const authForm = reactive<{ sourceClassId: number | null; targetCourseId: number | null; targetClassId: number | null; expiresAt: string }>({
+  sourceClassId: null,
+  targetCourseId: null,
+  targetClassId: null,
+  expiresAt: '',
+});
+const targetClasses = ref<ClassDto[]>([]);
+const creatingAuth = ref(false);
+
+/** 毕业兜底授权：明确接受哪些教学班 */
+const guaranteeForm = reactive<{ courseId: number | null; classIds: number[] }>({ courseId: null, classIds: [] });
+const guaranteeClasses = ref<ClassDto[]>([]);
+const creatingGuarantee = ref(false);
 
 const submitting = ref(false);
 const rechecking = ref(false);
@@ -71,6 +90,171 @@ async function loadAuthorizations(): Promise<void> {
     authorizations.value = data.authorizations;
   } catch (error) {
     reportApiError(error, '读取升级授权失败');
+  }
+}
+
+async function loadGuaranteeAuthorizations(): Promise<void> {
+  if (batchId.value === null) return;
+  try {
+    const data = await api.get<{ authorizations: GuaranteeAuthorizationRow[] }>('/guarantee-authorizations', {
+      batchId: batchId.value,
+    });
+    guaranteeAuthorizations.value = data.authorizations;
+  } catch (error) {
+    reportApiError(error, '读取毕业兜底授权失败');
+  }
+}
+
+async function loadEnrolled(): Promise<void> {
+  try {
+    const data = await api.get<{ enrolled: EnrolledRow[] }>('/student/records');
+    enrolled.value = data.enrolled;
+  } catch (error) {
+    reportApiError(error, '读取已选课程失败');
+  }
+}
+
+async function onAuthSourceChange(): Promise<void> {
+  authForm.targetClassId = null;
+  targetClasses.value = [];
+  if (authForm.targetCourseId === null) return;
+  try {
+    const data = await api.get<{ items: ClassDto[] }>('/classes', { courseId: authForm.targetCourseId, pageSize: 100 });
+    targetClasses.value = data.items;
+  } catch (error) {
+    reportApiError(error, '读取目标教学班失败');
+  }
+}
+
+async function createAuthorization(): Promise<void> {
+  if (authForm.sourceClassId === null || authForm.targetCourseId === null) {
+    toast.warning('请选择原教学班和目标课程');
+    return;
+  }
+  const source = enrolled.value.find((e) => e.classId === authForm.sourceClassId);
+  const target = courseOptions.value.find((c) => c.id === authForm.targetCourseId);
+  const ok = await askConfirm({
+    title: '确认自动替换授权',
+    message: `同意系统在你满足资格与时间限制时，用「${target?.name ?? '目标课程'}」替换你当前在修的「${source?.courseName ?? '原课程'}」。授权必须由你本人确认，管理员不能代替。`,
+    details: [
+      '执行替换时会先检查替换后的完整课表，成立才会在同一事务内落实目标课并释放原课；失败会保留原课。',
+      '关键资料变化后授权会自动失效，需要重新确认。',
+    ],
+    confirmText: '确认授权',
+    danger: false,
+  });
+  if (!ok) return;
+  creatingAuth.value = true;
+  try {
+    await api.post('/authorizations', {
+      batchId: batchId.value,
+      sourceClassId: authForm.sourceClassId,
+      targetCourseId: authForm.targetCourseId,
+      targetClassId: authForm.targetClassId,
+      expiresAt: authForm.expiresAt ? new Date(authForm.expiresAt).toISOString() : null,
+    });
+    toast.success('已创建替换授权', ['到候补阶段可以点“使用授权自动替换”，或用它参与更高偏好的自动升级。']);
+    authForm.sourceClassId = null;
+    authForm.targetCourseId = null;
+    authForm.targetClassId = null;
+    authForm.expiresAt = '';
+    targetClasses.value = [];
+    await Promise.all([loadAuthorizations(), batchId.value !== null ? loadWaitlist(batchId.value) : Promise.resolve()]);
+  } catch (error) {
+    reportApiError(error, '创建授权失败');
+  } finally {
+    creatingAuth.value = false;
+  }
+}
+
+async function revokeAuthorization(row: AuthorizationRow): Promise<void> {
+  const ok = await askConfirm({
+    title: '撤销替换授权',
+    message: `撤销后，系统不会再自动用「${row.targetCourseName}」替换「${row.sourceCourseName}」。`,
+    confirmText: '确认撤销',
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    await api.del(`/authorizations/${row.id}`);
+    toast.success('已撤销授权');
+    await Promise.all([loadAuthorizations(), batchId.value !== null ? loadWaitlist(batchId.value) : Promise.resolve()]);
+  } catch (error) {
+    reportApiError(error, '撤销失败');
+  }
+}
+
+async function onGuaranteeCourseChange(): Promise<void> {
+  guaranteeForm.classIds = [];
+  guaranteeClasses.value = [];
+  if (guaranteeForm.courseId === null) return;
+  try {
+    const data = await api.get<{ items: ClassDto[] }>('/classes', { courseId: guaranteeForm.courseId, pageSize: 100 });
+    guaranteeClasses.value = data.items;
+  } catch (error) {
+    reportApiError(error, '读取教学班失败');
+  }
+}
+
+function toggleGuaranteeClass(classId: number): void {
+  if (guaranteeForm.classIds.includes(classId)) {
+    guaranteeForm.classIds = guaranteeForm.classIds.filter((id) => id !== classId);
+  } else {
+    guaranteeForm.classIds.push(classId);
+  }
+}
+
+async function createGuaranteeAuthorization(): Promise<void> {
+  if (batchId.value === null || guaranteeForm.courseId === null) {
+    toast.warning('请选择课程');
+    return;
+  }
+  if (guaranteeForm.classIds.length === 0) {
+    toast.warning('请至少选择一个你接受的教学班', ['没有接受任何教学班时，系统不会自动兜底。']);
+    return;
+  }
+  const course = courseOptions.value.find((c) => c.id === guaranteeForm.courseId);
+  const ok = await askConfirm({
+    title: '确认毕业兜底授权',
+    message: `同意系统只在「${course?.name ?? '该课程'}」你勾选的教学班范围内，为毕业必要课程做出自动安排（先用普通名额，再用毕业预留）。`,
+    details: ['未勾选的教学班不会被自动选择；缺少授权时系统不会自动扩大选择范围，而是形成待处理异常。'],
+    confirmText: '确认授权',
+    danger: false,
+  });
+  if (!ok) return;
+  creatingGuarantee.value = true;
+  try {
+    await api.post('/guarantee-authorizations', {
+      batchId: batchId.value,
+      courseId: guaranteeForm.courseId,
+      classIds: guaranteeForm.classIds,
+    });
+    toast.success('已保存毕业兜底授权');
+    guaranteeForm.courseId = null;
+    guaranteeForm.classIds = [];
+    guaranteeClasses.value = [];
+    await Promise.all([loadGuaranteeAuthorizations(), batchId.value !== null ? loadWaitlist(batchId.value) : Promise.resolve()]);
+  } catch (error) {
+    reportApiError(error, '保存兜底授权失败');
+  } finally {
+    creatingGuarantee.value = false;
+  }
+}
+
+async function revokeGuaranteeAuthorization(row: GuaranteeAuthorizationRow): Promise<void> {
+  const ok = await askConfirm({
+    title: '撤销毕业兜底授权',
+    message: `撤销后，系统不会在「${row.courseName}」上自动为你兜底，可能形成保障异常。`,
+    confirmText: '确认撤销',
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    await api.del(`/guarantee-authorizations/${row.id}`);
+    toast.success('已撤销兜底授权');
+    await loadGuaranteeAuthorizations();
+  } catch (error) {
+    reportApiError(error, '撤销失败');
   }
 }
 
@@ -114,7 +298,10 @@ async function loadCourses(): Promise<void> {
 
 /** 切换批次（v-model 已经写入 batchId） */
 function onBatchChange(): void {
-  if (batchId.value !== null) void loadWaitlist(batchId.value);
+  if (batchId.value !== null) {
+    void loadWaitlist(batchId.value);
+    void loadGuaranteeAuthorizations();
+  }
 }
 
 async function onCourseChange(): Promise<void> {
@@ -277,7 +464,8 @@ function rankText(entry: WaitlistEntry): string {
 onMounted(async () => {
   await loadBatches();
   await loadCourses();
-  await loadAuthorizations();
+  await Promise.all([loadAuthorizations(), loadEnrolled()]);
+  await loadGuaranteeAuthorizations();
   try {
     const data = await api.get<{ timeline: TimelineEvent[] }>('/student/timeline');
     timeline.value = data.timeline;
@@ -424,7 +612,10 @@ onMounted(async () => {
                 </span>
                 <div class="small muted">更新：{{ formatDateTime(entry.updatedAt) }}</div>
               </td>
-              <td>{{ rankText(entry) }}</td>
+              <td>
+                {{ rankText(entry) }}
+                <div v-if="entry.positionReason" class="small muted">顺位变化：{{ entry.positionReason }}</div>
+              </td>
               <td>{{ demandLabel(entry.demandLevel) }}</td>
               <td class="mono small">{{ entry.randomKey ? `${entry.randomKey.slice(0, 12)}…` : '—' }}</td>
               <td class="small">
@@ -497,11 +688,52 @@ onMounted(async () => {
         <h3 class="card__title">升级（替换）授权</h3>
       </div>
       <p class="tips">
-        授权由管理员授予：用一门目标课程替换当前已选的原教学班。关键资料变化后授权会自动失效，届时需要重新确认。
-        “使用授权自动替换”会走正式选课服务，先检查替换后的完整课表，成立才在同一事务内执行。
+        替换授权必须由你本人确认：同意系统用一门目标课程替换你当前已选的原教学班。管理员确认毕业资格不能代替你同意退换课程。
+        执行“使用授权自动替换”时会先检查替换后的完整课表，成立才在同一事务内落实目标课并释放原课；失败会保留原课。
       </p>
-      <div v-if="authorizations.length === 0" class="muted">当前没有授权记录。</div>
-      <div v-else class="table-wrap">
+
+      <div class="grid grid--3" style="margin-top: 8px">
+        <label class="field">
+          <span class="field__label">原教学班（当前在修）</span>
+          <select v-model.number="authForm.sourceClassId" class="select">
+            <option :value="null">请选择</option>
+            <option v-for="row in enrolled" :key="row.classId" :value="row.classId">
+              {{ row.courseName }}（{{ row.classId }}）
+            </option>
+          </select>
+        </label>
+        <label class="field">
+          <span class="field__label">目标课程</span>
+          <select v-model.number="authForm.targetCourseId" class="select" @change="onAuthSourceChange">
+            <option :value="null">请选择</option>
+            <option v-for="course in courseOptions" :key="course.id" :value="course.id">
+              {{ course.code }} {{ course.name }}
+            </option>
+          </select>
+        </label>
+        <label class="field">
+          <span class="field__label">目标教学班（可选，留空表示符合资格与时间限制的班）</span>
+          <select v-model.number="authForm.targetClassId" class="select">
+            <option :value="null">不指定</option>
+            <option v-for="cls in targetClasses" :key="cls.id" :value="cls.id">
+              {{ cls.classCode }}（普通余量 {{ cls.generalAvailable }}）
+            </option>
+          </select>
+        </label>
+      </div>
+      <label class="field">
+        <span class="field__label">授权过期时间（可选）</span>
+        <input v-model="authForm.expiresAt" class="input" type="datetime-local" />
+      </label>
+      <div class="inline" style="margin-top: 8px">
+        <button class="btn btn--primary" type="button" :disabled="creatingAuth" @click="createAuthorization">
+          {{ creatingAuth ? '提交中…' : '我确认创建替换授权' }}
+        </button>
+        <span v-if="enrolled.length === 0" class="muted small">当前没有在修课程，无法建立替换授权。</span>
+      </div>
+
+      <div v-if="authorizations.length === 0" class="muted" style="margin-top: 10px">当前没有授权记录。</div>
+      <div v-else class="table-wrap" style="margin-top: 10px">
         <table class="table">
           <thead>
             <tr>
@@ -529,13 +761,99 @@ onMounted(async () => {
               <td class="small muted">{{ formatDateTime(row.usedAt) }}</td>
               <td class="small muted">{{ row.note ?? '—' }}</td>
               <td>
+                <div class="inline">
+                  <button
+                    class="btn btn--sm btn--primary"
+                    type="button"
+                    :disabled="row.status !== 'active' || actionEntryId === -row.id"
+                    @click="useAuthorization(row)"
+                  >
+                    {{ actionEntryId === -row.id ? '替换中…' : '使用授权自动替换' }}
+                  </button>
+                  <button
+                    class="btn btn--sm btn--danger"
+                    type="button"
+                    :disabled="row.status === 'used' || row.status === 'revoked'"
+                    @click="revokeAuthorization(row)"
+                  >
+                    撤销
+                  </button>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card__header">
+        <h3 class="card__title">毕业兜底授权</h3>
+      </div>
+      <p class="tips">
+        只有你本人明确接受的教学班，系统才会在毕业保障中自动安排（先用可用普通名额，再用毕业预留）。
+        没有授权或未接受任何教学班时，系统不会自动扩大选择，而是形成待处理异常等待管理员处理。
+      </p>
+      <div class="grid grid--2">
+        <label class="field">
+          <span class="field__label">课程</span>
+          <select v-model.number="guaranteeForm.courseId" class="select" @change="onGuaranteeCourseChange">
+            <option :value="null">请选择课程</option>
+            <option v-for="course in courseOptions" :key="course.id" :value="course.id">
+              {{ course.code }} {{ course.name }}
+            </option>
+          </select>
+        </label>
+      </div>
+      <div v-if="guaranteeClasses.length > 0">
+        <span class="field__label">我接受的教学班（可多选）</span>
+        <div class="list">
+          <label v-for="cls in guaranteeClasses" :key="cls.id" class="list__item">
+            <span class="inline">
+              <input type="checkbox" :checked="guaranteeForm.classIds.includes(cls.id)" @change="toggleGuaranteeClass(cls.id)" />
+              <strong>{{ cls.classCode }}</strong>
+              <span class="small muted">{{ cls.teacher?.name ?? '未指定教师' }}</span>
+              <span class="small muted">{{ cls.sessions.map((s) => s.text).join('；') }}</span>
+              <span class="spacer"></span>
+              <span class="small muted">普通余量 {{ cls.generalAvailable }} / 预留 {{ cls.reservedSeats }}</span>
+            </span>
+          </label>
+        </div>
+      </div>
+      <div class="inline" style="margin-top: 8px">
+        <button class="btn btn--primary" type="button" :disabled="creatingGuarantee" @click="createGuaranteeAuthorization">
+          {{ creatingGuarantee ? '提交中…' : '我确认毕业兜底授权' }}
+        </button>
+      </div>
+
+      <div v-if="guaranteeAuthorizations.length === 0" class="muted" style="margin-top: 10px">当前没有兜底授权记录。</div>
+      <div v-else class="table-wrap" style="margin-top: 10px">
+        <table class="table table--compact">
+          <thead>
+            <tr>
+              <th>课程</th>
+              <th>接受的教学班</th>
+              <th>状态</th>
+              <th>授权时间</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in guaranteeAuthorizations" :key="row.id">
+              <td>{{ row.courseName }}</td>
+              <td class="mono small">{{ row.classIds }}</td>
+              <td>
+                <span class="badge" :class="row.status === 'active' ? 'badge--ok' : 'badge--muted'">{{ row.status }}</span>
+              </td>
+              <td class="small muted">{{ formatDateTime(row.grantedAt) }}</td>
+              <td>
                 <button
-                  class="btn btn--sm btn--primary"
+                  class="btn btn--sm btn--danger"
                   type="button"
-                  :disabled="row.status !== 'active' || actionEntryId === -row.id"
-                  @click="useAuthorization(row)"
+                  :disabled="row.status !== 'active'"
+                  @click="revokeGuaranteeAuthorization(row)"
                 >
-                  {{ actionEntryId === -row.id ? '替换中…' : '使用授权自动替换' }}
+                  撤销
                 </button>
               </td>
             </tr>

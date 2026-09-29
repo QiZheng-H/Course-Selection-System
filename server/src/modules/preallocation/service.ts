@@ -199,6 +199,8 @@ export function applyPreallocations(
       actor,
       reason: '专业课预分配',
       allowReserved: false,
+      // 预分配发生在首轮之前，属于系统内部落实，不受“正式选退课阶段”限制
+      allowFrozen: true,
       idempotencyKey: `prealloc:${row.id}`,
     });
     if (result.ok) {

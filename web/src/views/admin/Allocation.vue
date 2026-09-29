@@ -1,13 +1,15 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue';
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue';
 import { api } from '@/api/client';
 import { newIdempotencyKey } from '@/api/idempotency';
+import { fetchTask, isTaskActive, waitForTask } from '@/api/tasks';
 import { askConfirm } from '@/stores/confirm';
 import { reportApiError, useToast } from '@/stores/toast';
 import type {
   AllocationItem,
   AllocationRun,
   AllocationRunDetail,
+  BackgroundTask,
   BatchDto,
   PreallocationRow,
   PreallocationsPayload,
@@ -43,6 +45,7 @@ const actionRowId = ref<number | null>(null);
 
 const freezing = ref(false);
 const allocating = ref(false);
+const publishing = ref<number | null>(null);
 const enqueuing = ref(false);
 const runs = ref<AllocationRun[]>([]);
 const lastRun = ref<AllocationRun | null>(null);
@@ -51,6 +54,13 @@ const detailFilter = ref('');
 const loadingDetail = ref(false);
 const publishKeys = reactive<Record<number, string>>({});
 const term = ref('2026-2027-1');
+
+/** 当前后台任务状态（页面展示处理中 / 成功 / 失败 / 超时） */
+const task = ref<BackgroundTask | null>(null);
+const taskError = ref<string | null>(null);
+const taskKind = ref<'simulate' | 'publish' | 'publish-run' | null>(null);
+let pollTimer: number | null = null;
+let unmounted = false;
 
 const freezeForce = ref(false);
 
@@ -200,51 +210,165 @@ async function allocateRun(mode: 'simulate' | 'publish'): Promise<void> {
   if (batchId.value === null || !batch.value) return;
   const idempotencyKey = mode === 'publish' ? publishKeyFor(batchId.value) : undefined;
   const ok = await askConfirm({
-    title: mode === 'publish' ? '发布分配结果' : '试算分配（不发布）',
+    title: mode === 'publish' ? '试算并发布（新建一次执行）' : '试算分配（不发布）',
     message:
       mode === 'publish'
-        ? '发布会真正写入选课结果，并成为该批次的正式结果。此操作使用幂等键，重复提交同一意图不会产生第二次结果。'
-        : '试算只生成执行记录与判定明细，不改变学生课表。',
+        ? '本次会先试算并校验（保障异常未处理时会拒绝），再在一个事务里落实全部结果、释放预留、自动生成候补并发布批次；任何一步失败都会整体回滚。'
+        : '试算只生成执行记录、判定明细与异常记录，不改动学生课表、保障状态与预留数量。',
     details: [
       `批次：${batch.value.name}（${batch.value.term}）`,
       batch.value.snapshotHash ? `快照：${batch.value.snapshotHash.slice(0, 16)}…` : '尚未冻结：请先冻结批次',
-      mode === 'publish' ? `幂等键：${String(idempotencyKey).slice(0, 18)}…` : '模式：simulate',
+      mode === 'publish'
+        ? `幂等键：${String(idempotencyKey).slice(0, 18)}…`
+        : '推荐流程：试算 → 处理异常 → 在“执行历史”里发布指定的试算结果',
     ],
-    confirmText: mode === 'publish' ? '确认发布' : '开始试算',
+    confirmText: mode === 'publish' ? '确认执行并发布' : '开始试算',
     danger: mode === 'publish',
   });
   if (!ok) return;
   allocating.value = true;
+  taskError.value = null;
+  taskKind.value = mode;
   try {
-    const result = await api.post<{
-      runId: number;
-      status: string;
-      report: AllocationReportView | null;
-      failure?: { code: string; reason: string };
-      idempotentReplay: boolean;
-    }>(`/admin/batches/${batchId.value}/allocate`, {
+    const start = await api.post<{ taskId: number; reused: boolean }>(`/admin/batches/${batchId.value}/allocate`, {
       mode,
       idempotencyKey,
     });
-    if (result.failure) {
-      toast.error('分配未完成', [`[${result.failure.code}] ${result.failure.reason}`]);
-    } else {
-      toast.success(mode === 'publish' ? '分配结果已发布' : '试算完成', [
-        `执行 #${result.runId}（${result.status}）${result.idempotentReplay ? '，命中幂等键，返回已有结果' : ''}`,
-        result.report ? `已分配 ${result.report.allocated ?? 0} / 未分配 ${result.report.rejected ?? 0}` : '',
-        result.report ? `释放预留 ${result.report.releasedReservedSeats ?? 0}，兜底满足 ${result.report.guaranteeFulfilled ?? 0}` : '',
-      ]);
-      if (mode === 'publish' && batchId.value !== null) {
+    // 后台任务：接口立即返回任务标识，页面轮询到终态
+    const finished = await trackTask(start.taskId);
+    if (!finished) return;
+    if (finished.status === 'succeeded' || finished.status === 'timeout' || finished.status === 'failed') {
+      await loadRuns();
+      const runId = finished.result?.runId ?? finished.runId;
+      if (runId) await loadRunDetail(runId);
+      if (mode === 'publish' && finished.status === 'succeeded' && batchId.value !== null) {
         delete publishKeys[batchId.value];
       }
-      await loadRuns();
-      await loadRunDetail(result.runId);
     }
   } catch (error) {
     reportApiError(error, mode === 'publish' ? '发布失败' : '试算失败');
   } finally {
     allocating.value = false;
   }
+}
+
+/** 轮询后台任务并展示状态；返回终态任务（失败时也返回，交由调用方处理） */
+async function trackTask(taskId: number): Promise<BackgroundTask | null> {
+  stopPolling();
+  try {
+    const initial = await fetchTask(taskId);
+    task.value = initial;
+    if (!isTaskActive(initial)) {
+      onTaskSettled(initial);
+      return initial;
+    }
+    const finished = await waitForTask(taskId, {
+      intervalMs: 500,
+      timeoutMs: 180_000,
+      onUpdate: (update) => {
+        task.value = update;
+      },
+      shouldStop: () => unmounted,
+    });
+    task.value = finished;
+    if (isTaskActive(finished)) {
+      // 超时仍未结束：继续后台轮询，页面提示“处理中”
+      toast.warning('任务仍在处理中', ['可以稍后刷新查看结果，计算不会阻塞其它操作']);
+      schedulePoll(taskId);
+      return null;
+    }
+    onTaskSettled(finished);
+    return finished;
+  } catch (error) {
+    taskError.value = error instanceof Error ? error.message : String(error);
+    reportApiError(error, '读取任务状态失败');
+    return null;
+  }
+}
+
+function schedulePoll(taskId: number): void {
+  pollTimer = window.setTimeout(() => {
+    void (async () => {
+      const latest = await fetchTask(taskId);
+      task.value = latest;
+      if (isTaskActive(latest)) {
+        schedulePoll(taskId);
+      } else {
+        onTaskSettled(latest);
+      }
+    })();
+  }, 1500);
+}
+
+function stopPolling(): void {
+  if (pollTimer !== null) {
+    window.clearTimeout(pollTimer);
+    pollTimer = null;
+  }
+}
+
+function onTaskSettled(finished: BackgroundTask): void {
+  if (finished.status === 'succeeded') {
+    const report = finished.result?.report;
+    toast.success(taskKind.value === 'publish' ? '分配结果已发布' : '试算完成', [
+      `任务 #${finished.id} 成功${finished.result?.idempotentReplay ? '（命中幂等键，复用已有结果）' : ''}`,
+      report ? `已分配 ${report.allocated ?? 0} / 未分配 ${report.rejected ?? 0}` : '',
+      report ? `释放预留 ${report.releasedReservedSeats ?? 0}，兜底满足 ${report.guaranteeFulfilled ?? 0}` : '',
+      (report?.exceptions?.length ?? 0) > 0 ? `产生 ${report?.exceptions?.length ?? 0} 条异常，请到“异常处理”逐条确认` : '',
+    ]);
+    void loadRuns();
+  } else if (finished.status === 'timeout') {
+    toast.error('任务超时，未发布任何结果', ['可以缩小数据范围或提高超时上限后重试']);
+  } else if (finished.status === 'failed') {
+    toast.error('任务失败，正式数据未改变', [`[${finished.errorCode ?? 'INTERNAL'}] ${finished.errorMessage ?? '未知原因'}`]);
+  }
+}
+
+/** 重新执行同一种任务（失败 / 超时后的重试） */
+async function retryTask(): Promise<void> {
+  const kind = taskKind.value;
+  if (kind === 'publish-run') {
+    const runId = task.value?.result?.runId ?? null;
+    if (runId) await publishRunById(runId);
+    return;
+  }
+  if (kind === 'simulate' || kind === 'publish') await allocateRun(kind);
+}
+
+/** 发布指定的、检查通过的试算结果 */
+async function publishRunById(runId: number): Promise<void> {
+  const ok = await askConfirm({
+    title: `发布试算结果 #${runId}`,
+    message:
+      '发布前会校验批次状态、快照版本、保障异常与实际容量；选课落位、保护状态、预留释放、自动候补与批次发布在同一个事务里完成，任何一步失败都会整体回滚。',
+    details: ['重复发布同一结果只会返回已有结果，不会取消学生已有课程。'],
+    confirmText: '确认发布',
+    danger: true,
+  });
+  if (!ok) return;
+  publishing.value = runId;
+  taskKind.value = 'publish-run';
+  try {
+    const result = await api.post<{ runId: number; status: string; alreadyPublished: boolean }>(
+      `/admin/runs/${runId}/publish`,
+      {},
+    );
+    toast.success('已发布试算结果', [
+      `执行 #${result.runId}`,
+      result.alreadyPublished ? '该结果此前已发布，本次返回已有结果' : '批次已进入“结果已发布”，首轮候补已自动生成',
+    ]);
+    taskError.value = null;
+    await loadBatches();
+  } catch (error) {
+    taskError.value = error instanceof Error ? error.message : String(error);
+    reportApiError(error, '发布失败');
+  } finally {
+    publishing.value = null;
+  }
+}
+
+function canPublishRun(run: AllocationRun): boolean {
+  return run.status === 'succeeded' && run.mode === 'simulate';
 }
 
 async function loadRuns(): Promise<void> {
@@ -317,7 +441,14 @@ const decisionCounts = computed(() => {
   return counts;
 });
 
-onMounted(loadBatches);
+onMounted(() => {
+  void loadBatches();
+});
+
+onUnmounted(() => {
+  unmounted = true;
+  stopPolling();
+});
 </script>
 
 <template>
@@ -366,18 +497,62 @@ onMounted(loadBatches);
           {{ freezing ? '冻结中…' : '冻结批次' }}
         </button>
         <button class="btn btn--ghost" type="button" :disabled="allocating || batchId === null" @click="allocateRun('simulate')">
-          试算（simulate）
+          {{ allocating && taskKind === 'simulate' ? '试算中…' : '试算（simulate）' }}
         </button>
         <button class="btn btn--danger" type="button" :disabled="allocating || batchId === null" @click="allocateRun('publish')">
-          发布结果（publish）
+          {{ allocating && taskKind === 'publish' ? '执行中…' : '试算并发布（新建执行）' }}
         </button>
         <button class="btn btn--ghost" type="button" :disabled="enqueuing || batchId === null" @click="enqueueWaitlist">
           {{ enqueuing ? '处理中…' : '首轮落选转候补' }}
         </button>
       </div>
+      <ol class="tips" style="margin-top: 8px">
+        <li>冻结批次生成快照（之后资料变化不影响本轮结果）。</li>
+        <li>执行“试算”，只生成判定、报告与异常记录，不改变任何正式数据。</li>
+        <li>到“异常处理”页对关键保障异常逐条形成处理结果。</li>
+        <li>在下方“执行历史”里，对检查通过的试算结果点“发布此结果”。</li>
+        <li>发布成功后批次进入“结果已发布”，首轮候补自动生成；退改选与公开补选在候补阶段进行。</li>
+      </ol>
       <p class="tips" style="margin-top: 6px">
-        发布模式要求先冻结快照；发布时传入幂等键，若因网络等原因重试，请复用同一个键，后端会返回同一次执行结果（IDEMPOTENCY_MISMATCH 表示同一键被用于不同请求）。
+        发布使用整体事务：选课落位、保护状态、预留释放、自动候补与批次发布必须全部成功，否则整体回滚。重复发布同一结果只会返回已有结果，不会取消学生已有课程。
       </p>
+
+      <div v-if="task" class="alert" style="margin-top: 10px">
+        <div class="inline">
+          <span
+            class="badge"
+            :class="{
+              'badge--warn': task.status === 'queued' || task.status === 'running',
+              'badge--ok': task.status === 'succeeded',
+              'badge--danger': task.status === 'failed' || task.status === 'timeout',
+            }"
+          >
+            {{
+              task.status === 'queued'
+                ? '排队中'
+                : task.status === 'running'
+                  ? '处理中'
+                  : task.status === 'succeeded'
+                    ? '成功'
+                    : task.status === 'timeout'
+                      ? '超时'
+                      : task.status === 'failed'
+                        ? '失败'
+                        : task.status
+            }}
+          </span>
+          <span class="muted small">任务 #{{ task.id }} · 进度 {{ task.percent }}%</span>
+          <span v-if="task.runId" class="muted small">执行 #{{ task.runId }}</span>
+          <span class="spacer"></span>
+          <button v-if="isTaskActive(task)" class="btn btn--ghost btn--sm" type="button" @click="stopPolling">停止刷新</button>
+          <button v-else-if="task.retryable && taskKind" class="btn btn--primary btn--sm" type="button" @click="retryTask">重试</button>
+        </div>
+        <div v-if="task.status === 'failed' || task.status === 'timeout'" class="small" style="margin-top: 6px">
+          [{{ task.errorCode ?? 'INTERNAL' }}] {{ task.errorMessage ?? '任务未完成' }}
+          <span v-if="task.status === 'timeout'">—— 超时不发布任何部分结果，可缩小范围后重试。</span>
+        </div>
+        <div v-if="taskError" class="small" style="margin-top: 6px">{{ taskError }}</div>
+      </div>
     </section>
 
     <section class="card">
@@ -512,6 +687,16 @@ onMounted(loadBatches);
             </span>
             <span class="spacer"></span>
             <button class="btn btn--sm btn--ghost" type="button" @click="loadRunDetail(run.id)">查看逐条判定</button>
+            <button
+              v-if="canPublishRun(run)"
+              class="btn btn--sm btn--primary"
+              type="button"
+              :disabled="publishing === run.id"
+              @click="publishRunById(run.id)"
+            >
+              {{ publishing === run.id ? '发布中…' : '发布此结果' }}
+            </button>
+            <span v-else-if="run.status === 'published'" class="badge badge--ok">已发布</span>
           </div>
           <div v-if="run.failureReason" class="alert alert--error small" style="margin-top: 6px">
             [{{ run.failureCode }}] {{ run.failureReason }}

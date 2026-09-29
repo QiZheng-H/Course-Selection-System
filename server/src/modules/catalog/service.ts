@@ -36,6 +36,8 @@ export interface TeacherRow {
   name: string;
   department: string | null;
   title: string | null;
+  /** 教师信息为演示模拟配置 */
+  isDemo?: boolean;
 }
 
 export interface ClassDto extends SeatUsage {
@@ -52,6 +54,8 @@ export interface ClassDto extends SeatUsage {
   status: 'open' | 'closed' | 'cancelled';
   campus: string | null;
   note: string | null;
+  /** 教学班时间 / 容量 / 教师是否为演示模拟配置 */
+  isDemo?: boolean;
   sessions: SessionDto[];
 }
 
@@ -131,8 +135,10 @@ function loadSessions(db: SqliteDb, classIds: number[]): Map<number, SessionDto[
 
 const CLASS_BASE_SQL = `
   SELECT tc.id, tc.class_code, tc.term, tc.course_id, tc.capacity, tc.reserved_seats, tc.status, tc.campus, tc.note,
-         c.code AS course_code, c.name AS course_name, c.credits, c.course_type, c.department,
-         t.id AS teacher_id, t.name AS teacher_name, t.department AS teacher_department, t.title AS teacher_title
+         tc.is_demo AS class_is_demo,
+         c.code AS course_code, c.name AS course_name, c.credits, c.course_type, c.department, c.is_demo AS course_is_demo,
+         t.id AS teacher_id, t.name AS teacher_name, t.department AS teacher_department, t.title AS teacher_title,
+         t.is_demo AS teacher_is_demo
   FROM teaching_classes tc
   JOIN courses c ON c.id = tc.course_id
   LEFT JOIN teachers t ON t.id = tc.teacher_id
@@ -148,6 +154,9 @@ interface ClassRawRow {
   status: 'open' | 'closed' | 'cancelled';
   campus: string | null;
   note: string | null;
+  class_is_demo: number;
+  course_is_demo: number;
+  teacher_is_demo: number | null;
   course_code: string;
   course_name: string;
   credits: number;
@@ -171,11 +180,19 @@ function toClassDto(db: SqliteDb, row: ClassRawRow, sessions: Map<number, Sessio
     courseType: row.course_type,
     department: row.department,
     teacher: row.teacher_id
-      ? { id: row.teacher_id, name: row.teacher_name ?? '', department: row.teacher_department, title: row.teacher_title }
+      ? {
+          id: row.teacher_id,
+          name: row.teacher_name ?? '',
+          department: row.teacher_department,
+          title: row.teacher_title,
+          isDemo: row.teacher_is_demo === 1,
+        }
       : null,
     status: row.status,
     campus: row.campus,
     note: row.note,
+    /** 教学班时间 / 容量 / 教师是否为演示模拟配置 */
+    isDemo: row.class_is_demo === 1 || row.teacher_is_demo === 1,
     sessions: sessions.get(row.id) ?? [],
     ...usage,
   };

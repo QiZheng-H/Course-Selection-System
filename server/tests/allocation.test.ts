@@ -12,7 +12,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import request from 'supertest';
-import { authHeader, createClassRow, login, setupBatch, setupTestContext, submitPreferences, type TestContext } from './helpers.js';
+import { authHeader, createClassRow, login, runAllocationTask, setupBatch, setupTestContext, submitPreferences, type TestContext } from './helpers.js';
 
 let ctx: TestContext;
 
@@ -30,6 +30,24 @@ interface CandidateClass {
   capacity: number;
   reserved_seats: number;
   class_code: string;
+}
+
+/**
+ * 选一门“当前教学阶段（三/1）”的官方课程：
+ * 种子库不会为当前阶段课程预置修读记录，因此适合用来验证首轮分配。
+ */
+function currentStageCourse(): { id: number; code: string; name: string } {
+  const row = ctx.db
+    .prepare(
+      `SELECT c.id, c.code, c.name FROM courses c
+       JOIN curriculum_courses cc ON cc.course_id = c.id
+       JOIN teaching_classes tc ON tc.course_id = c.id
+       WHERE cc.suggested_term LIKE '三/1%' AND tc.status = 'open'
+       GROUP BY c.id ORDER BY c.code LIMIT 1`,
+    )
+    .get() as { id: number; code: string; name: string } | undefined;
+  if (!row) throw new Error('演示数据里没有当前阶段的官方课程');
+  return row;
 }
 
 function openClasses(courseId: number): CandidateClass[] {
@@ -81,15 +99,14 @@ async function loginMany(usernames: string[]): Promise<Map<string, string>> {
 async function freezeAndAllocate(batchId: number, adminCookie: string, mode: 'simulate' | 'publish') {
   const freeze = await request(ctx.app).post(`/api/admin/batches/${batchId}/freeze`).set(authHeader(adminCookie)).send({});
   expect(freeze.status, JSON.stringify(freeze.body)).toBe(200);
-  const run = await request(ctx.app)
-    .post(`/api/admin/batches/${batchId}/allocate`)
-    .set(authHeader(adminCookie))
-    .send({ mode, idempotencyKey: `${mode}-${batchId}-${Math.random().toString(16).slice(2)}` });
-  expect(run.status, JSON.stringify(run.body)).toBe(200);
-  return run.body.data as {
-    runId: number;
-    status: string;
-    report: { allocated: number; rejected: number; guaranteeFulfilled: number; exceptions: unknown[] };
+  const run = await runAllocationTask(ctx, adminCookie, batchId, mode, {
+    idempotencyKey: `${mode}-${batchId}-${Math.random().toString(16).slice(2)}`,
+  });
+  return {
+    runId: run.runId,
+    status: run.status,
+    report: run.report ?? { allocated: 0, rejected: 0, guaranteeFulfilled: 0, exceptions: [] },
+    task: run.task,
   };
 }
 
@@ -146,7 +163,7 @@ describe('固定随机键：重交、重试、重新加入都不重抽', () => {
 describe('统一分配：排序、容量与可重试', () => {
   it('同一输入重复试算得到完全相同的结果，发布不会超额', async () => {
     const batch = await setupBatch(ctx, { name: '重复试算' });
-    const course = ctx.db.prepare('SELECT id FROM courses ORDER BY id LIMIT 1').get() as { id: number };
+    const course = currentStageCourse();
     const classes = openClasses(course.id);
     const usernames = ['20241004', '20241005', '20241006', '20241007'];
     const cookies = await loginMany(usernames);
@@ -158,28 +175,23 @@ describe('统一分配：排序、容量与可重试', () => {
     }
 
     const first = await freezeAndAllocate(batch.batchId, batch.adminCookie, 'simulate');
-    const second = await request(ctx.app)
-      .post(`/api/admin/batches/${batch.batchId}/allocate`)
-      .set(authHeader(batch.adminCookie))
-      .send({ mode: 'simulate' });
-    expect(second.status).toBe(200);
+    const second = await runAllocationTask(ctx, batch.adminCookie, batch.batchId, 'simulate');
 
     const rowsOf = (runId: number) =>
       ctx.db
         .prepare('SELECT student_id, course_id, class_id, decision, demand_level, global_rank FROM allocation_items WHERE run_id = ? ORDER BY student_id, course_id')
         .all(runId);
-    expect(rowsOf(second.body.data.runId)).toEqual(rowsOf(first.runId));
+    expect(rowsOf(second.runId)).toEqual(rowsOf(first.runId));
 
     // 发布模式的判定与试算完全一致（同一快照、同一固定随机键）
-    const publish = await request(ctx.app)
-      .post(`/api/admin/batches/${batch.batchId}/allocate`)
-      .set(authHeader(batch.adminCookie))
-      .send({ mode: 'publish', idempotencyKey: `publish-consistency-${batch.batchId}` });
-    expect(publish.status).toBe(200);
+    const publish = await runAllocationTask(ctx, batch.adminCookie, batch.batchId, 'publish', {
+      idempotencyKey: `publish-consistency-${batch.batchId}`,
+    });
+    expect(publish.status).toBe('published');
 
     const allocatedItems = ctx.db
       .prepare("SELECT student_id, class_id FROM allocation_items WHERE run_id = ? AND decision = 'allocated'")
-      .all(publish.body.data.runId) as Array<{ student_id: number; class_id: number }>;
+      .all(publish.runId) as Array<{ student_id: number; class_id: number }>;
     for (const item of allocatedItems) {
       const count = (
         ctx.db.prepare("SELECT COUNT(*) AS c FROM enrollments WHERE class_id = ? AND status = 'enrolled'").get(item.class_id) as {
@@ -278,7 +290,7 @@ describe('统一分配：排序、容量与可重试', () => {
 
 describe('毕业保障', () => {
   it('多个请求竞争最后一个名额不会超额；预留名额不被普通申请占用', async () => {
-    const batch = await setupBatch(ctx, { name: '容量竞争' });
+    const batch = await setupBatch(ctx, { name: '容量竞争', status: 'waitlist' });
     const stamp = Date.now() % 100000;
     const courseInfo = ctx.db
       .prepare(
@@ -351,6 +363,12 @@ describe('毕业保障', () => {
       .post('/api/admin/guarantee')
       .set(authHeader(batch.adminCookie))
       .send({ batchId: batch.batchId, courseId, studentIds: [protectedStudentId], reason: '毕业保护' });
+    // 学生本人给出毕业兜底授权（管理员确认毕业资格不能代替），且明确接受该教学班
+    const grant = await request(ctx.app)
+      .post('/api/guarantee-authorizations')
+      .set(authHeader(cookies.get('20241015')!))
+      .send({ batchId: batch.batchId, courseId, classIds: [classId] });
+    expect(grant.status, JSON.stringify(grant.body)).toBe(200);
     // 两名学生都提交志愿，普通竞争阶段谁都拿不到（因为没有普通名额）
     for (const username of ['20241015', '20241016']) {
       const result = await submitPreferences(ctx, cookies.get(username)!, batch.batchId, [
@@ -375,11 +393,10 @@ describe('毕业保障', () => {
     expect(run.report.guaranteeFulfilled).toBe(1);
 
     // 发布后，只有受保护的学生真正占用这个预留名额
-    const publish = await request(ctx.app)
-      .post(`/api/admin/batches/${batch.batchId}/allocate`)
-      .set(authHeader(batch.adminCookie))
-      .send({ mode: 'publish', idempotencyKey: `guarantee-publish-${batch.batchId}` });
-    expect(publish.status, JSON.stringify(publish.body)).toBe(200);
+    const publish = await runAllocationTask(ctx, batch.adminCookie, batch.batchId, 'publish', {
+      idempotencyKey: `guarantee-publish-${batch.batchId}`,
+    });
+    expect(publish.status, JSON.stringify(publish.task)).toBe('published');
     const enrolled = ctx.db
       .prepare("SELECT student_id, uses_reserved FROM enrollments WHERE class_id = ? AND status = 'enrolled'")
       .all(classId) as Array<{ student_id: number; uses_reserved: number }>;
@@ -521,7 +538,7 @@ describe('失败恢复与安全', () => {
 
   it('管理员可以重复执行发布而不会重复扣名额（可安全重试）', async () => {
     const batch = await setupBatch(ctx, { name: '发布重试' });
-    const course = ctx.db.prepare('SELECT id FROM courses ORDER BY id LIMIT 1').get() as { id: number };
+    const course = currentStageCourse();
     const classes = openClasses(course.id);
     const cookie = (await loginMany(['20241019'])).get('20241019')!;
     await submitPreferences(ctx, cookie, batch.batchId, [{ courseId: course.id, globalRank: 1, classIds: [classes[0].id] }]);
@@ -533,22 +550,31 @@ describe('失败恢复与安全', () => {
     expect(allocated.length).toBeGreaterThan(0);
 
     const before = snapshotEnrollments().length;
-    const publishOne = await request(ctx.app)
-      .post(`/api/admin/batches/${batch.batchId}/allocate`)
-      .set(authHeader(batch.adminCookie))
-      .send({ mode: 'publish', idempotencyKey: `publish-once-${batch.batchId}` });
-    expect(publishOne.status, JSON.stringify(publishOne.body)).toBe(200);
+    const publishOne = await runAllocationTask(ctx, batch.adminCookie, batch.batchId, 'publish', {
+      idempotencyKey: `publish-once-${batch.batchId}`,
+    });
+    expect(publishOne.status, JSON.stringify(publishOne.task)).toBe('published');
     const afterFirst = snapshotEnrollments().length;
 
-    // 幂等键相同：第二次调用直接复用上次结果
+    // 幂等键相同：第二次调用复用同一个后台任务，不会取消已有课程、也不会重复占位
     const publishTwo = await request(ctx.app)
       .post(`/api/admin/batches/${batch.batchId}/allocate`)
       .set(authHeader(batch.adminCookie))
       .send({ mode: 'publish', idempotencyKey: `publish-once-${batch.batchId}` });
     expect(publishTwo.status).toBe(200);
-    expect(publishTwo.body.data.idempotentReplay).toBe(true);
+    expect(publishTwo.body.data.reused).toBe(true);
+    expect(publishTwo.body.data.taskId).toBe(publishOne.taskId);
     expect(snapshotEnrollments().length).toBe(afterFirst);
     expect(afterFirst).toBeGreaterThanOrEqual(before);
+
+    // 直接重复发布同一条已发布结果也返回已有结果，不再改动任何选课记录
+    const republish = await request(ctx.app)
+      .post(`/api/admin/runs/${publishOne.runId}/publish`)
+      .set(authHeader(batch.adminCookie))
+      .send({});
+    expect(republish.status, JSON.stringify(republish.body)).toBe(200);
+    expect(republish.body.data.idempotentReplay).toBe(true);
+    expect(snapshotEnrollments().length).toBe(afterFirst);
   });
 
   it('学生不能读取他人的私人记录', async () => {
@@ -564,7 +590,7 @@ describe('失败恢复与安全', () => {
 
   it('分配任务超时不会发布部分结果', async () => {
     const batch = await setupBatch(ctx, { name: '超时保护' });
-    const course = ctx.db.prepare('SELECT id FROM courses ORDER BY id LIMIT 1').get() as { id: number };
+    const course = currentStageCourse();
     const classes = openClasses(course.id);
     const cookie = (await loginMany(['20241022'])).get('20241022')!;
     await submitPreferences(ctx, cookie, batch.batchId, [{ courseId: course.id, globalRank: 1, classIds: [classes[0].id] }]);
@@ -572,13 +598,9 @@ describe('失败恢复与安全', () => {
     expect(freeze.status).toBe(200);
 
     // timeoutMs = 0 → 立刻超时；结果必须是失败，且没有任何选课记录被写入
-    const run = await request(ctx.app)
-      .post(`/api/admin/batches/${batch.batchId}/allocate`)
-      .set(authHeader(batch.adminCookie))
-      .send({ mode: 'publish', timeoutMs: 0 });
-    expect(run.status).toBe(200);
-    expect(run.body.data.status).toBe('failed');
-    expect(run.body.data.failure.code).toBe('TASK_TIMEOUT');
+    const run = await runAllocationTask(ctx, batch.adminCookie, batch.batchId, 'publish', { timeoutMs: 0 });
+    expect(run.task.status).toBe('timeout');
+    expect(run.task.errorCode).toBe('TASK_TIMEOUT');
 
     const enrollments = (
       ctx.db
@@ -588,8 +610,13 @@ describe('失败恢复与安全', () => {
     expect(enrollments).toBe(0);
     const failedRun = ctx.db
       .prepare('SELECT status, failure_code FROM allocation_runs WHERE id = ?')
-      .get(run.body.data.runId) as { status: string; failure_code: string };
+      .get(run.runId) as { status: string; failure_code: string };
     expect(failedRun.status).toBe('failed');
     expect(failedRun.failure_code).toBe('TASK_TIMEOUT');
+    // 批次不能被标成已发布
+    const batchRow = ctx.db.prepare('SELECT status FROM selection_batches WHERE id = ?').get(batch.batchId) as {
+      status: string;
+    };
+    expect(batchRow.status).toBe('frozen');
   });
 });
