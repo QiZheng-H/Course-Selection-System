@@ -67,6 +67,66 @@ export interface ValidationResult {
 
 const emptyPayload: DraftPayload = { preferences: [], groups: [] };
 
+/**
+ * 志愿草稿的入口归一化。保存草稿、校验、提交都先经过这里，保证界面与规则层之间
+ * 只有一个稳定的数据形态。
+ *
+ * 核心不变量（替代组的语义）：
+ *   一个替代组里**只放备选课程**，主课程不属于该组。
+ *   规则层按“组内课程”判断互斥（preference_group_courses）；如果主课程也在组里，
+ *   它自己就会把自己挡住，出现“组内已落实一门”而无法落实的情况。
+ *
+ * 同时把组的展示名交给服务端生成（例如「高等数学A 或 高等数学B」），
+ * 界面只需要给出课程顺序，不必拼中文，也不必自己命名。
+ */
+export function normalizeDraftPayload(db: SqliteDb, payload: DraftPayload): DraftPayload {
+  const ordered = [...(payload.preferences ?? [])].sort((a, b) => a.globalRank - b.globalRank);
+  const declared = new Map((payload.groups ?? []).map((group) => [group.code, group]));
+  const coursesOfGroup = new Map<string, number[]>();
+  for (const pref of ordered) {
+    if (!pref.groupCode) continue;
+    const list = coursesOfGroup.get(pref.groupCode) ?? [];
+    if (!list.includes(pref.courseId)) list.push(pref.courseId);
+    coursesOfGroup.set(pref.groupCode, list);
+  }
+
+  const courseIds = ordered.map((p) => p.courseId);
+  const nameOf = new Map<number, string>();
+  if (courseIds.length > 0) {
+    const rows = db
+      .prepare(`SELECT id, name FROM courses WHERE id IN (${courseIds.map(() => '?').join(',')})`)
+      .all(...courseIds) as Array<{ id: number; name: string }>;
+    for (const row of rows) nameOf.set(row.id, row.name);
+  }
+
+  const groups: DraftGroupInput[] = [];
+  const substituteGroupOf = new Map<number, string>();
+  for (const [code, courseIdsInGroup] of coursesOfGroup) {
+    if (courseIdsInGroup.length < 2) continue; // 只有一门不成组
+    for (const courseId of courseIdsInGroup.slice(1)) {
+      substituteGroupOf.set(courseId, code);
+    }
+    const names = courseIdsInGroup.map((id) => nameOf.get(id) ?? String(id));
+    groups.push({
+      code,
+      name: declared.get(code)?.name?.trim() || names.join(' 或 '),
+      note: declared.get(code)?.note ?? null,
+    });
+  }
+
+  return {
+    preferences: ordered.map((pref) => ({
+      courseId: pref.courseId,
+      globalRank: pref.globalRank,
+      classIds: pref.classIds ?? [],
+      note: pref.note ?? null,
+      // 主课程脱离组，保证它自己能正常落实
+      groupCode: substituteGroupOf.get(pref.courseId) ?? null,
+    })),
+    groups,
+  };
+}
+
 export function getDraft(db: SqliteDb, studentId: number, batchId: number): DraftPayload & { updatedAt: string | null } {
   const row = db
     .prepare('SELECT payload, updated_at FROM preference_drafts WHERE student_id = ? AND batch_id = ?')
@@ -86,15 +146,17 @@ export function getDraft(db: SqliteDb, studentId: number, batchId: number): Draf
 
 export function saveDraft(db: SqliteDb, studentId: number, batchId: number, payload: DraftPayload): { updatedAt: string } {
   const updatedAt = nowIso();
+  const normalized = normalizeDraftPayload(db, payload);
   db.prepare(
     `INSERT INTO preference_drafts (student_id, batch_id, payload, updated_at) VALUES (?, ?, ?, ?)
      ON CONFLICT (student_id, batch_id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`,
-  ).run(studentId, batchId, stableStringify(payload), updatedAt);
+  ).run(studentId, batchId, stableStringify(normalized), updatedAt);
   return { updatedAt };
 }
 
 /** 校验草稿：错误会阻止提交，警告只是提示 */
-export function validateDraft(db: SqliteDb, studentId: number, _batchId: number, payload: DraftPayload): ValidationResult {
+export function validateDraft(db: SqliteDb, studentId: number, _batchId: number, rawPayload: DraftPayload): ValidationResult {
+  const payload = normalizeDraftPayload(db, rawPayload);
   const issues: ValidationIssue[] = [];
   const preferences = [...(payload.preferences ?? [])].sort((a, b) => a.globalRank - b.globalRank);
   const groups = payload.groups ?? [];
@@ -383,7 +445,7 @@ export function submitPreferences(
   db: SqliteDb,
   studentId: number,
   batchId: number,
-  payload: DraftPayload,
+  rawPayload: DraftPayload,
   actor: AuthUser,
 ): {
   submissionId: number;
@@ -397,6 +459,7 @@ export function submitPreferences(
   if (!batch) throw notFound('批次不存在');
   assertSubmissionWindow(batch);
 
+  const payload = normalizeDraftPayload(db, rawPayload);
   const validation = validateDraft(db, studentId, batchId, payload);
   if (!validation.ok) {
     const firstError = validation.issues.find((i) => i.level === 'error');
@@ -952,13 +1015,15 @@ export function previewDraft(
   db: SqliteDb,
   studentId: number,
   batchId: number,
-  payload: DraftPayload,
+  rawPayload: DraftPayload,
 ): PreferencePreview {
   const batch = db.prepare('SELECT id, term FROM selection_batches WHERE id = ?').get(batchId) as
     | { id: number; term: string }
     | undefined;
   if (!batch) throw notFound('批次不存在');
 
+  // 与保存/校验/提交使用同一套归一化，保证预演看到的结构与真正提交的一致
+  const payload = normalizeDraftPayload(db, rawPayload);
   const preferences = [...(payload.preferences ?? [])]
     .filter((p) => Number.isInteger(p.courseId))
     .sort((a, b) => a.globalRank - b.globalRank);
