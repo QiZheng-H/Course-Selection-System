@@ -40,9 +40,15 @@ export interface DraftGroupInput {
   note?: string | null;
 }
 
+/**
+ * 读到的替代组：界面只提供 code，归一化后服务端补上组名与组内课程。
+ * 用联合类型如实表达“读到的组可能只有最简声明，也可能是完整结构”。
+ */
+export type DraftGroupLike = DraftGroupInput | SubstituteGroup;
+
 export interface DraftPayload {
   preferences: DraftPreferenceInput[];
-  groups: DraftGroupInput[];
+  groups: DraftGroupLike[];
 }
 
 export interface ValidationIssue {
@@ -68,20 +74,23 @@ export interface ValidationResult {
 const emptyPayload: DraftPayload = { preferences: [], groups: [] };
 
 /**
- * 志愿草稿的入口归一化。保存草稿、校验、提交都先经过这里，保证界面与规则层之间
- * 只有一个稳定的数据形态。
+ * 志愿草稿的入口归一化。保存草稿、校验、提交、预演都先经过这里，
+ * 让界面与规则层之间只有一个稳定的数据形态。
  *
- * 核心不变量（替代组的语义）：
- *   一个替代组里**只放备选课程**，主课程不属于该组。
- *   规则层按“组内课程”判断互斥（preference_group_courses）；如果主课程也在组里，
- *   它自己就会把自己挡住，出现“组内已落实一门”而无法落实的情况。
+ * 前端提交的形态是：
+ *   主课程（groupCode = null，排在前面） + 备选课程（同一个 groupCode）。
+ * 也就是“替代组里只放备选课程”，主课程不属于该组 —— 这是刻意的：
+ * 规则层按“组内课程”判断互斥，如果主课程也在组里，它自己就会把自己挡住，
+ * 出现“组内已落实一门”而永远无法落实的情况。
  *
- * 同时把组的展示名交给服务端生成（例如「高等数学A 或 高等数学B」），
+ * 组的展示名由服务端生成（例如「高等数学A 或 高等数学B」），
  * 界面只需要给出课程顺序，不必拼中文，也不必自己命名。
  */
 export function normalizeDraftPayload(db: SqliteDb, payload: DraftPayload): DraftPayload {
   const ordered = [...(payload.preferences ?? [])].sort((a, b) => a.globalRank - b.globalRank);
-  const declared = new Map((payload.groups ?? []).map((group) => [group.code, group]));
+  const declared = new Map<string, DraftGroupInput>(
+    (payload.groups ?? []).map((group) => [group.code, group] as const),
+  );
   const coursesOfGroup = new Map<string, number[]>();
   for (const pref of ordered) {
     if (!pref.groupCode) continue;
@@ -99,18 +108,26 @@ export function normalizeDraftPayload(db: SqliteDb, payload: DraftPayload): Draf
     for (const row of rows) nameOf.set(row.id, row.name);
   }
 
-  const groups: DraftGroupInput[] = [];
-  const substituteGroupOf = new Map<number, string>();
+  const rankOf = new Map<number, number>();
+  ordered.forEach((pref, index) => rankOf.set(pref.courseId, index + 1));
+
+  // 组内课程 = 显式声明了该组的课程本身（也就是备选课程），主课程不声明、因此不在其中。
+  // 展示时把主课程带进来，拼成「A 或 B」——这是学生真正想看到的一句话。
+  const anchorOf = anchorCourseByGroup(ordered, coursesOfGroup);
+  const groups: SubstituteGroup[] = [];
   for (const [code, courseIdsInGroup] of coursesOfGroup) {
-    if (courseIdsInGroup.length < 2) continue; // 只有一门不成组
-    for (const courseId of courseIdsInGroup.slice(1)) {
-      substituteGroupOf.set(courseId, code);
-    }
-    const names = courseIdsInGroup.map((id) => nameOf.get(id) ?? String(id));
+    if (courseIdsInGroup.length === 0) continue;
+    const anchorCourseId = anchorOf.get(code);
+    const names = [anchorCourseId, ...courseIdsInGroup]
+      .filter((id): id is number => id !== undefined)
+      .map((id) => nameOf.get(id) ?? String(id));
+    const declaredName = declared.get(code)?.name?.trim();
     groups.push({
+      groupId: 0,
       code,
-      name: declared.get(code)?.name?.trim() || names.join(' 或 '),
-      note: declared.get(code)?.note ?? null,
+      name: declaredName ? declaredName : names.join(' 或 '),
+      rankHint: Math.min(...courseIdsInGroup.map((id) => rankOf.get(id) ?? 9999), 9999),
+      courseIds: courseIdsInGroup,
     });
   }
 
@@ -120,11 +137,35 @@ export function normalizeDraftPayload(db: SqliteDb, payload: DraftPayload): Draf
       globalRank: pref.globalRank,
       classIds: pref.classIds ?? [],
       note: pref.note ?? null,
-      // 主课程脱离组，保证它自己能正常落实
-      groupCode: substituteGroupOf.get(pref.courseId) ?? null,
+      // 保留前端声明的组归属：主课程为 null，备选带组编码
+      groupCode: pref.groupCode ?? null,
     })),
     groups,
   };
+}
+
+/**
+ * 推导每个替代组的“主课程”：排在组内第一门之前、且自身不属于任何组的最后一门课。
+ * 例：顺序为「高等数学A（无组）→ 高等数学B（ALT1）」，主课程就是高等数学A。
+ *
+ * 主课程刻意不放进替代组：规则层按组内课程判断互斥，
+ * 若主课程也在组里，它自己就会把自己挡住（“组内已落实一门”），永远无法落实。
+ */
+function anchorCourseByGroup(
+  ordered: DraftPreferenceInput[],
+  coursesOfGroup: Map<string, number[]>,
+): Map<string, number> {
+  const anchorOf = new Map<string, number>();
+  for (const [code, courseIdsInGroup] of coursesOfGroup) {
+    const firstMemberIndex = ordered.findIndex((pref) => pref.courseId === courseIdsInGroup[0]);
+    for (let i = firstMemberIndex - 1; i >= 0; i -= 1) {
+      const candidate = ordered[i];
+      if (candidate.groupCode) continue; // 属于某个组的课程不能当主课程
+      anchorOf.set(code, candidate.courseId);
+      break;
+    }
+  }
+  return anchorOf;
 }
 
 export function getDraft(db: SqliteDb, studentId: number, batchId: number): DraftPayload & { updatedAt: string | null } {
@@ -152,6 +193,24 @@ export function saveDraft(db: SqliteDb, studentId: number, batchId: number, payl
      ON CONFLICT (student_id, batch_id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`,
   ).run(studentId, batchId, stableStringify(normalized), updatedAt);
   return { updatedAt };
+}
+
+/**
+ * 把 DraftPayload.groups 里的元素统一成完整的替代组结构。
+ * 走 normalizeDraftPayload 时本来就是完整的；兼容只有 code 的最简声明，
+ * 组内课程按“哪些志愿声明了这个组编码”推导。
+ */
+function toSubstituteGroup(group: DraftGroupLike, preferences: DraftPreferenceInput[]): SubstituteGroup {
+  if ('courseIds' in group) return group;
+  const courseIds = preferences.filter((pref) => pref.groupCode === group.code).map((pref) => pref.courseId);
+  const ranks = preferences.filter((pref) => pref.groupCode === group.code).map((pref) => pref.globalRank);
+  return {
+    groupId: 0,
+    code: group.code,
+    name: group.name,
+    rankHint: ranks.length > 0 ? Math.min(...ranks) : Number.MAX_SAFE_INTEGER,
+    courseIds,
+  };
 }
 
 /** 校验草稿：错误会阻止提交，警告只是提示 */
@@ -224,16 +283,9 @@ export function validateDraft(db: SqliteDb, studentId: number, _batchId: number,
     membership.set(pref.groupCode, list);
   }
 
-  const substituteGroups: SubstituteGroup[] = groups.map((group) => ({
-    groupId: 0,
-    code: group.code,
-    name: group.name,
-    rankHint: Math.min(
-      ...preferences.filter((p) => p.groupCode === group.code).map((p) => p.globalRank),
-      Number.MAX_SAFE_INTEGER,
-    ),
-    courseIds: preferences.filter((p) => p.groupCode === group.code).map((p) => p.courseId),
-  }));
+  // 组结构由 normalizeDraftPayload 统一推导（组名也在这里生成），
+  // 校验与提交共用同一份结果，避免两处对“什么是组”有两套理解。
+  const substituteGroups: SubstituteGroup[] = groups.map((group) => toSubstituteGroup(group, preferences));
 
   for (const group of substituteGroups) {
     if (group.courseIds.length === 0) {
@@ -391,26 +443,6 @@ export function validateDraft(db: SqliteDb, studentId: number, _batchId: number,
 }
 
 /**
- * 决定替代组的插入顺序。
- * preference_group_courses.group_id 外键指向 preference_groups，因此“组”必须比引用它的
- * 课程记录先插入。返回的顺序保证：被引用的组一定排在引用它的组之前（组不嵌套时即为原顺序）。
- */
-function orderedGroupsForInsert(
-  groups: DraftGroupInput[],
-  preferences: DraftPreferenceInput[],
-): DraftGroupInput[] {
-  if (groups.length <= 1) return groups;
-  // 组之间目前没有层级关系，只需保证每个被课程引用的 code 都存在即可。
-  // 这里把“被引用次数多的组”排在前面，作为对将来引入组嵌套时的稳定默认顺序。
-  const usage = new Map<string, number>();
-  for (const pref of preferences) {
-    if (!pref.groupCode) continue;
-    usage.set(pref.groupCode, (usage.get(pref.groupCode) ?? 0) + 1);
-  }
-  return [...groups].sort((a, b) => (usage.get(b.code) ?? 0) - (usage.get(a.code) ?? 0));
-}
-
-/**
  * 提交 / 撤回的时间与状态校验。
  * 关键点：截止判断使用服务器时间与管理员配置的开放/截止时刻，
  * 不能依赖“管理员恰好在截止时点了冻结”。
@@ -529,18 +561,12 @@ export function submitPreferences(
     );
 
     const groupIdByCode = new Map<string, number>();
-    // 依赖顺序显式化：同一替代组先插入“所有组”，再插入组内课程与志愿。
-    // 这样前端把志愿排成任何顺序（例如把备选课程拖到成员前面）都不会撞外键约束。
-    for (const group of orderedGroupsForInsert(payload.groups ?? [], validation.normalized)) {
+    // 依赖顺序：同一替代组必须先插入“组”，再插入组内课程（preference_group_courses.group_id 有外键）。
+    // 组名与组内课程都由 normalizeDraftPayload 推导好，这里只负责落库。
+    for (const group of validation.groups) {
       const groupInfo = db
         .prepare('INSERT INTO preference_groups (submission_id, code, name, rank_hint, note) VALUES (?, ?, ?, ?, ?)')
-        .run(
-          submissionId,
-          group.code,
-          group.name,
-          Math.min(...validation.normalized.filter((p) => p.groupCode === group.code).map((p) => p.globalRank), 9999),
-          group.note ?? null,
-        );
+        .run(submissionId, group.code, group.name, group.rankHint, null);
       groupIdByCode.set(group.code, Number(groupInfo.lastInsertRowid));
     }
 
@@ -571,8 +597,9 @@ export function submitPreferences(
       insertKey.run(studentId, pref.courseId, term, deriveRandomKey(seed, studentId, pref.courseId), submittedAt);
     }
 
-    // 提交成功后同步草稿，保证界面显示的与提交内容一致
-    saveDraft(db, studentId, batchId, { preferences: validation.normalized, groups: payload.groups ?? [] });
+    // 提交成功后同步草稿，保证界面显示的与提交内容一致。
+    // 传 payload（已归一化）给 saveDraft 保险：即使归一化逻辑将来变化，草稿也不会退化成另一种形态。
+    saveDraft(db, studentId, batchId, payload);
 
     writeAudit(db, {
       actorId: actor.id,
@@ -926,8 +953,6 @@ interface ClassOption {
   totalAvailable: number;
 }
 
-const EMPTY_SEAT = { generalAvailable: 0, totalAvailable: 0 };
-
 function loadClassOptions(db: SqliteDb, term: string): Map<number, ClassOption[]> {
   const rows = db
     .prepare(
@@ -1031,6 +1056,25 @@ export function previewDraft(
   for (const pref of preferences) {
     if (pref.groupCode) groupCodeOf.set(pref.courseId, pref.groupCode);
   }
+  // 主课程自己不携带 groupCode，必须反查“谁是这一组的主课程”，
+  // 否则主课程落实时不会把该组标记为已落实，备选就会重复入选。
+  const groupAnchors = anchorCourseByGroup(
+    preferences,
+    (() => {
+      const map = new Map<string, number[]>();
+      for (const pref of preferences) {
+        if (!pref.groupCode) continue;
+        const list = map.get(pref.groupCode) ?? [];
+        if (!list.includes(pref.courseId)) list.push(pref.courseId);
+        map.set(pref.groupCode, list);
+      }
+      return map;
+    })(),
+  );
+  const anchorToGroup = new Map<number, string>();
+  for (const [code, courseId] of groupAnchors) anchorToGroup.set(courseId, code);
+  const groupOfCourse = (courseId: number): string | null =>
+    groupCodeOf.get(courseId) ?? anchorToGroup.get(courseId) ?? null;
 
   const classesByCourse = loadClassOptions(db, batch.term);
   const existing = loadStudentSchedule(db, studentId);
@@ -1086,6 +1130,8 @@ export function previewDraft(
     const demandLevel = assessment?.demandLevel ?? 'D0';
     const options = classesByCourse.get(pref.courseId) ?? [];
     const courseAvailable = options.reduce((sum, o) => sum + o.generalAvailable, 0);
+    // 这门课所属的替代组：主课程自身不带 groupCode，靠“谁是该组主课程”反查得到
+    const groupCode = groupOfCourse(pref.courseId);
     // 教学班顺序：学生填写的偏好在前，其余按班号
     const ordered = [
       ...(pref.classIds ?? []).map((id) => options.find((o) => o.classId === id)).filter((o): o is ClassOption => Boolean(o)),
@@ -1098,7 +1144,8 @@ export function previewDraft(
       courseName: info?.name ?? String(pref.courseId),
       courseCode: info?.code ?? '—',
       credits: info?.credits ?? 0,
-      groupCode: groupCodeOf.get(pref.courseId) ?? null,
+      // 主课程本身不带 groupCode，但界面需要知道它属于哪一组，因此统一用反查结果
+      groupCode,
       demandLevel,
       demandText: describeDemand(assessment?.demandLevel ?? 'D0', assessment?.reasons ?? [], info?.name ?? ''),
       courseAvailable,
@@ -1137,7 +1184,6 @@ export function previewDraft(
       });
       continue;
     }
-    const groupCode = base.groupCode;
     if (groupCode && fulfilledGroups.has(groupCode)) {
       attempts.push({
         ...base,

@@ -3,13 +3,14 @@
  * 志愿填报向导：① 选课 → ② 排顺序 → ③ 预演并提交。
  *
  * 设计原则（面向第一次使用的学生）：
- *   - 学生只做三件事：勾课、拖顺序、确认。所有编号、备选组编码、需求等级翻译都由系统完成；
+ *   - 学生只做三件事：勾课、拖顺序、确认。名次、备选关系、需求等级翻译都由系统完成；
  *   - “全局排名”等于列表位置，界面上只读，因此不可能重复、也不会出现空洞；
  *   - “替代组”以「加备选」的方式表达，学生不需要理解组这个概念；
  *   - 提交前给出课表预演：会排成什么样、哪一门排不进、被谁挡住。
  *
- * 规则层的唯一真值仍在后端（preferences.global_rank / preference_groups 数据结构不变），
- * 这里只是换一种更好懂的表达方式。
+ * 数据形态由后端统一归一化（见 preference/service.ts 的 normalizeDraftPayload）：
+ * 一个替代组里只放备选课程，主课程不属于该组，组名也由服务端生成。
+ * 前端提交时只负责给出“课程 + 顺序 + 组编码”，不拼中文、不做规则判断。
  */
 import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { api } from '@/api/client';
@@ -19,7 +20,6 @@ import type {
   BatchDto,
   ClassDto,
   CourseDto,
-  DraftGroup,
   DraftPreference,
   PreferencePreview,
   PreferencesPayload,
@@ -45,9 +45,8 @@ interface EditablePreference extends DraftPreference {
   credits: number;
 }
 
-/** 备用组内的课程不单独参与全局排序，因此额外记录一份信息 */
-interface GroupMember {
-  groupCode: string;
+/** 被折叠到主课程下面的备选课程 */
+interface AltCourse {
   courseId: number;
   courseCode: string;
   courseName: string;
@@ -62,8 +61,10 @@ const batch = ref<BatchDto | null>(null);
 const payload = ref<PreferencesPayload | null>(null);
 
 const items = ref<EditablePreference[]>([]);
-const groups = ref<DraftGroup[]>([]);
-const groupMembers = ref<GroupMember[]>([]);
+/** 主课程 courseId → 它的备选课程（服务端会把这些备选放进同一个替代组） */
+const alternatives = ref<Record<number, AltCourse[]>>({});
+/** 主课程 courseId → 替代组编码（仅界面内部使用） */
+const groupCodeOf = ref<Record<number, string>>({});
 
 const courseCache = reactive<Record<number, { code: string; name: string; credits: number }>>({});
 const classCache = reactive<Record<number, ClassDto[]>>({});
@@ -90,7 +91,7 @@ const courseSearchKeyword = ref('');
 const courseSearchResults = ref<CourseDto[]>([]);
 const searchingCourses = ref(false);
 
-/** 备选课程选择器当前展开在哪一行 */
+/** 备选选择器当前展开在哪一门主课程上 */
 const altPickerFor = ref<number | null>(null);
 const altKeyword = ref('');
 const altResults = ref<CourseDto[]>([]);
@@ -128,7 +129,6 @@ const stepLabels = ['选课', '排顺序', '预演并提交'];
 interface DraftDiffRow {
   courseId: number;
   courseName: string;
-  kind: 'added' | 'removed' | 'rank' | 'classes' | 'group';
   detail: string;
 }
 
@@ -140,42 +140,36 @@ const draftDiff = computed<{ changed: boolean; rows: DraftDiffRow[] }>(() => {
   const submittedByCourse = new Map(submission.items.map((item) => [item.courseId, item]));
   const draftByCourse = new Map(items.value.map((item) => [item.courseId, item]));
   const rows: DraftDiffRow[] = [];
+  const altIds = new Set(allAlternatives().map((alt) => alt.courseId));
 
   for (const [courseId, item] of draftByCourse) {
     const submitted = submittedByCourse.get(courseId);
     if (!submitted) {
-      rows.push({ courseId, courseName: item.courseName, kind: 'added', detail: `草稿新增（第 ${item.globalRank} 志愿）` });
+      rows.push({ courseId, courseName: item.courseName, detail: `草稿新增（第 ${item.globalRank} 志愿）` });
       continue;
     }
     if (submitted.globalRank !== item.globalRank) {
       rows.push({
         courseId,
         courseName: item.courseName,
-        kind: 'rank',
         detail: `志愿顺序 第 ${submitted.globalRank} → 第 ${item.globalRank}`,
       });
     }
     const submittedClasses = submitted.classChoices.map((choice) => choice.classId);
     if (JSON.stringify(submittedClasses) !== JSON.stringify(item.classIds)) {
-      rows.push({
-        courseId,
-        courseName: item.courseName,
-        kind: 'classes',
-        detail: '教学班偏好有变化',
-      });
+      rows.push({ courseId, courseName: item.courseName, detail: '教学班偏好有变化' });
     }
     const submittedGroup = submitted.groupCode ?? '';
     const draftGroup = item.groupCode ?? '';
     if (submittedGroup !== draftGroup) {
-      rows.push({ courseId, courseName: item.courseName, kind: 'group', detail: '备选关系有变化' });
+      rows.push({ courseId, courseName: item.courseName, detail: '备选关系有变化' });
     }
   }
   for (const [courseId, submitted] of submittedByCourse) {
-    if (!draftByCourse.has(courseId) && !groupMembers.value.some((member) => member.courseId === courseId)) {
+    if (!draftByCourse.has(courseId) && !altIds.has(courseId)) {
       rows.push({
         courseId,
         courseName: submitted.courseName,
-        kind: 'removed',
         detail: `草稿已移除（已提交版本为第 ${submitted.globalRank} 志愿）`,
       });
     }
@@ -185,23 +179,24 @@ const draftDiff = computed<{ changed: boolean; rows: DraftDiffRow[] }>(() => {
 
 /* ------------------------------ 备选（替代组） ------------------------------ */
 
-function membersOf(groupCode: string): GroupMember[] {
-  return groupMembers.value.filter((member) => member.groupCode === groupCode);
+function altsOf(courseId: number): AltCourse[] {
+  return alternatives.value[courseId] ?? [];
 }
 
-function mainOf(groupCode: string): EditablePreference | undefined {
-  return items.value.find((item) => item.groupCode === groupCode);
+function allAlternatives(): AltCourse[] {
+  return Object.values(alternatives.value).flat();
 }
 
-/** 该课程是否已经在草稿里（作为志愿或备选） */
+/** 该课程是否已经在清单里（作为志愿或备选） */
 function inDraft(courseId: number): boolean {
-  return items.value.some((item) => item.courseId === courseId) || groupMembers.value.some((m) => m.courseId === courseId);
+  return items.value.some((item) => item.courseId === courseId) || allAlternatives().some((alt) => alt.courseId === courseId);
 }
 
 function nextGroupCode(): string {
-  let index = groups.value.length + 1;
+  let index = Object.keys(groupCodeOf.value).length + 1;
   let code = `ALT${index}`;
-  while (groups.value.some((group) => group.code === code)) {
+  const used = new Set(Object.values(groupCodeOf.value));
+  while (used.has(code)) {
     index += 1;
     code = `ALT${index}`;
   }
@@ -214,26 +209,29 @@ function sortedItems(): EditablePreference[] {
   return [...items.value].sort((a, b) => a.globalRank - b.globalRank);
 }
 
+/**
+ * 展开成后端接受的扁平志愿列表：每门主课程后面紧跟它的备选课程。
+ * 备选排在主课程之后，正好对应“主课程优先尝试、备选作为退路”的语义。
+ */
 function serialize() {
-  // 备用组课程不单独出现在 preferences 里：它们通过 groupCode 挂到主课程所在的组，
-  // 但规则要求“志愿里的每门课程都要有排名”，因此备选也按排在主课程之后的位置登记。
   const sequence: Array<{ courseId: number; classIds: number[]; note: string | null; groupCode: string | null }> = [];
   for (const item of sortedItems()) {
+    const code = groupCodeOf.value[item.courseId];
     sequence.push({
       courseId: item.courseId,
       classIds: item.classIds,
       note: item.note ?? null,
-      groupCode: item.groupCode ?? null,
+      groupCode: null, // 主课程不进入替代组，否则会被自己挡住
     });
-    if (item.groupCode) {
-      for (const member of membersOf(item.groupCode)) {
-        sequence.push({ courseId: member.courseId, classIds: [], note: null, groupCode: item.groupCode });
-      }
+    if (!code) continue;
+    for (const alt of altsOf(item.courseId)) {
+      sequence.push({ courseId: alt.courseId, classIds: [], note: null, groupCode: code });
     }
   }
   return {
     preferences: sequence.map((entry, index) => ({ ...entry, globalRank: index + 1 })),
-    groups: groups.value.map((group) => ({ code: group.code, name: group.name, note: group.note ?? null })),
+    // 组由服务端按 groupCode 归并并生成组名，这里只需声明编码
+    groups: Object.entries(groupCodeOf.value).map(([, code]) => ({ code, name: '', note: null })),
   };
 }
 
@@ -246,7 +244,7 @@ function markDirty(): void {
   }, 900);
 }
 
-watch([items, groups, groupMembers], markDirty, { deep: true });
+watch([items, alternatives, groupCodeOf], markDirty, { deep: true });
 
 /* ------------------------------ 数据加载 ------------------------------ */
 
@@ -270,8 +268,7 @@ async function loadBatch(targetBatchId: number): Promise<void> {
     batch.value = data.batch;
     batchId.value = data.batch.id;
 
-    const draft = data.draft;
-    const draftItems: EditablePreference[] = (draft.preferences ?? []).map((pref) => ({
+    const draftItems: EditablePreference[] = (data.draft.preferences ?? []).map((pref) => ({
       courseId: pref.courseId,
       globalRank: pref.globalRank,
       classIds: pref.classIds ?? [],
@@ -282,9 +279,9 @@ async function loadBatch(targetBatchId: number): Promise<void> {
       credits: 0,
     }));
     items.value = draftItems;
-    groups.value = (draft.groups ?? []).map((group) => ({ code: group.code, name: group.name, note: group.note ?? null }));
-    groupMembers.value = [];
-    lastSavedAt.value = draft.updatedAt ?? null;
+    alternatives.value = {};
+    groupCodeOf.value = {};
+    lastSavedAt.value = data.draft.updatedAt ?? null;
     validation.value = null;
     preview.value = null;
     validationError.value = '';
@@ -299,8 +296,7 @@ async function loadBatch(targetBatchId: number): Promise<void> {
         item.credits = info.credits;
       }
     }
-    // 备用组课程在草稿里也是普通志愿，按同组把它们折叠回主课程下面
-    collapseGroupMembers();
+    await collapseAlternatives();
   } catch (error) {
     reportApiError(error, '读取志愿失败');
   } finally {
@@ -312,34 +308,54 @@ async function loadBatch(targetBatchId: number): Promise<void> {
 
 /**
  * 草稿存储的是“扁平 + 组编码”，界面需要的是“主课程 + 折叠的备选”。
- * 每组排在最前面的课程作为主课程，其余折叠为备选。
+ * 同一组里排在最前面的课程作为主课程，其余折叠为备选。
  */
-function collapseGroupMembers(): void {
-  const members: GroupMember[] = [];
+async function collapseAlternatives(): Promise<void> {
+  const seen = new Map<string, number>();
   const keep: EditablePreference[] = [];
-  const seenGroup = new Set<string>();
+  const alts: Record<number, AltCourse[]> = {};
+  const codes: Record<number, string> = {};
+
   for (const item of sortedItems()) {
     const code = item.groupCode;
     if (!code) {
       keep.push(item);
       continue;
     }
-    if (!seenGroup.has(code)) {
-      seenGroup.add(code);
+    const anchor = seen.get(code);
+    if (anchor === undefined) {
+      seen.set(code, item.courseId);
       keep.push(item);
       continue;
     }
-    members.push({
-      groupCode: code,
+    const list = alts[anchor] ?? [];
+    list.push({
       courseId: item.courseId,
       courseCode: item.courseCode,
       courseName: item.courseName,
       credits: item.credits,
     });
+    alts[anchor] = list;
+    codes[anchor] = code;
   }
+
   items.value = keep;
-  groupMembers.value = members;
+  alternatives.value = alts;
+  groupCodeOf.value = codes;
   normalizeRanks();
+
+  // 备选课程的详情单独补一次（它们不再出现在 items 里）
+  await Promise.all(allAlternatives().map((alt) => ensureCourseInfo(alt.courseId)));
+  for (const list of Object.values(alternatives.value)) {
+    for (const alt of list) {
+      const info = courseCache[alt.courseId];
+      if (info) {
+        alt.courseCode = info.code;
+        alt.courseName = info.name;
+        alt.credits = info.credits;
+      }
+    }
+  }
 }
 
 async function loadBatches(): Promise<void> {
@@ -392,27 +408,39 @@ async function addCourse(course: CourseDto): Promise<void> {
 }
 
 function removePreference(index: number): void {
-  const [removed] = items.value.splice(index, 1);
-  if (removed?.groupCode) {
-    const remaining = membersOf(removed.groupCode);
-    if (remaining.length === 0) {
-      groups.value = groups.value.filter((group) => group.code !== removed.groupCode);
-    } else {
-      // 主课程没了：把第一个备选提升为新的主课程
-      const promoted = remaining[0];
-      groupMembers.value = groupMembers.value.filter((member) => member !== promoted);
-      items.value.push({
-        courseId: promoted.courseId,
-        globalRank: removed.globalRank,
-        classIds: [],
-        note: null,
-        groupCode: removed.groupCode,
-        courseCode: promoted.courseCode,
-        courseName: promoted.courseName,
-        credits: promoted.credits,
-      });
+  const list = sortedItems();
+  const removed = list[index];
+  if (!removed) return;
+  list.splice(index, 1);
+
+  // 主课程被移除时，它的第一个备选升为新的主课程，其余保留为备选
+  const alts = altsOf(removed.courseId);
+  const code = groupCodeOf.value[removed.courseId];
+  if (alts.length > 0 && code) {
+    const [promoted, ...rest] = alts;
+    list.splice(index, 0, {
+      courseId: promoted.courseId,
+      globalRank: 0,
+      classIds: [],
+      note: null,
+      groupCode: code,
+      courseCode: promoted.courseCode,
+      courseName: promoted.courseName,
+      credits: promoted.credits,
+    });
+    if (rest.length > 0) {
+      alternatives.value[promoted.courseId] = rest;
+      groupCodeOf.value[promoted.courseId] = code;
     }
   }
+  const restAlts = { ...alternatives.value };
+  delete restAlts[removed.courseId];
+  alternatives.value = restAlts;
+  const restCodes = { ...groupCodeOf.value };
+  delete restCodes[removed.courseId];
+  groupCodeOf.value = restCodes;
+
+  items.value = list;
   normalizeRanks();
   preview.value = null;
 }
@@ -425,12 +453,7 @@ function normalizeRanks(): void {
 
 /* ------------------------------ 第 2 步：排顺序 ------------------------------ */
 
-function move(index: number, delta: number): void {
-  const target = index + delta;
-  if (target < 0 || target >= items.value.length) return;
-  const list = sortedItems();
-  const [moved] = list.splice(index, 1);
-  list.splice(target, 0, moved);
+function applyOrder(list: EditablePreference[]): void {
   list.forEach((item, position) => {
     item.globalRank = position + 1;
   });
@@ -438,11 +461,20 @@ function move(index: number, delta: number): void {
   preview.value = null;
 }
 
+function move(index: number, delta: number): void {
+  const target = index + delta;
+  const list = sortedItems();
+  if (target < 0 || target >= list.length) return;
+  const [moved] = list.splice(index, 1);
+  list.splice(target, 0, moved);
+  applyOrder(list);
+}
+
 function onDragStart(index: number, event: DragEvent): void {
   dragIndex.value = index;
   if (event.dataTransfer) {
     event.dataTransfer.effectAllowed = 'move';
-    // Firefox 需要设置数据才会触发拖拽
+    // Firefox 需要写入数据才会真正开始拖拽
     event.dataTransfer.setData('text/plain', String(index));
   }
 }
@@ -461,11 +493,7 @@ function onDrop(index: number): void {
   const list = sortedItems();
   const [moved] = list.splice(from, 1);
   list.splice(index, 0, moved);
-  list.forEach((item, position) => {
-    item.globalRank = position + 1;
-  });
-  items.value = list;
-  preview.value = null;
+  applyOrder(list);
 }
 
 function onDragEnd(): void {
@@ -475,8 +503,8 @@ function onDragEnd(): void {
 
 /* --------------------------- 备选（替代组）管理 --------------------------- */
 
-function openAltPicker(index: number): void {
-  altPickerFor.value = altPickerFor.value === index ? null : index;
+function openAltPicker(courseId: number): void {
+  altPickerFor.value = altPickerFor.value === courseId ? null : courseId;
   altKeyword.value = '';
   altResults.value = [];
 }
@@ -496,71 +524,70 @@ async function searchAlternatives(): Promise<void> {
   }
 }
 
-function addAlternative(main: EditablePreference, course: CourseDto): void {
+async function addAlternative(main: EditablePreference, course: CourseDto): Promise<void> {
   if (inDraft(course.id)) {
     toast.warning('这门课已经在清单里了');
     return;
   }
-  let code = main.groupCode;
-  if (!code) {
-    code = nextGroupCode();
-    main.groupCode = code;
-    groups.value.push({ code, name: `${main.courseName} 或 …`, note: null });
-  }
   courseCache[course.id] = { code: course.code, name: course.name, credits: course.credits };
-  groupMembers.value.push({
-    groupCode: code,
+  const list = [...altsOf(main.courseId), {
     courseId: course.id,
     courseCode: course.code,
     courseName: course.name,
     credits: course.credits,
-  });
-  syncGroupNames();
+  }];
+  alternatives.value = { ...alternatives.value, [main.courseId]: list };
+  if (!groupCodeOf.value[main.courseId]) {
+    groupCodeOf.value = { ...groupCodeOf.value, [main.courseId]: nextGroupCode() };
+  }
   altPickerFor.value = null;
   preview.value = null;
   toast.success(`已加入备选：${course.name}`, [`如果「${main.courseName}」选不上，系统会尝试这一门。`]);
+  await ensureCourseInfo(course.id);
 }
 
-function removeAlternative(member: GroupMember): void {
-  groupMembers.value = groupMembers.value.filter((item) => item !== member);
-  const main = mainOf(member.groupCode);
-  if (main && membersOf(member.groupCode).length === 0) {
-    main.groupCode = null;
-    groups.value = groups.value.filter((group) => group.code !== member.groupCode);
+function removeAlternative(mainCourseId: number, alt: AltCourse): void {
+  const list = altsOf(mainCourseId).filter((item) => item.courseId !== alt.courseId);
+  const next = { ...alternatives.value };
+  if (list.length === 0) {
+    delete next[mainCourseId];
+    const codes = { ...groupCodeOf.value };
+    delete codes[mainCourseId];
+    groupCodeOf.value = codes;
+  } else {
+    next[mainCourseId] = list;
   }
-  syncGroupNames();
+  alternatives.value = next;
   preview.value = null;
 }
 
-function dissolveGroup(code: string): void {
-  const main = mainOf(code);
-  if (main) main.groupCode = null;
-  for (const member of membersOf(code)) {
-    items.value.push({
-      courseId: member.courseId,
-      globalRank: items.value.length + 1,
-      classIds: [],
-      note: null,
-      groupCode: null,
-      courseCode: member.courseCode,
-      courseName: member.courseName,
-      credits: member.credits,
-    });
-    void ensureCourseInfo(member.courseId);
-  }
-  groupMembers.value = groupMembers.value.filter((member) => member.groupCode !== code);
-  groups.value = groups.value.filter((group) => group.code !== code);
+/** 解散备选关系：备选课程变成独立的志愿，排在主课程之后 */
+function dissolveGroup(mainCourseId: number): void {
+  const alts = altsOf(mainCourseId);
+  const list = sortedItems();
+  const mainIndex = list.findIndex((item) => item.courseId === mainCourseId);
+  const promoted: EditablePreference[] = alts.map((alt) => ({
+    courseId: alt.courseId,
+    globalRank: 0,
+    classIds: [],
+    note: null,
+    groupCode: null,
+    courseCode: alt.courseCode,
+    courseName: alt.courseName,
+    credits: alt.credits,
+  }));
+  list.splice(mainIndex + 1, 0, ...promoted);
+
+  const next = { ...alternatives.value };
+  delete next[mainCourseId];
+  alternatives.value = next;
+  const codes = { ...groupCodeOf.value };
+  delete codes[mainCourseId];
+  groupCodeOf.value = codes;
+
+  items.value = list;
   normalizeRanks();
   preview.value = null;
-}
-
-/** 组名自动跟随成员变化，学生不需要自己命名 */
-function syncGroupNames(): void {
-  for (const group of groups.value) {
-    const main = mainOf(group.code);
-    const names = [main?.courseName, ...membersOf(group.code).map((m) => m.courseName)].filter(Boolean) as string[];
-    group.name = names.join(' 或 ');
-  }
 }
 
 /* ------------------------------ 教学班偏好 ------------------------------ */
@@ -669,12 +696,12 @@ async function runPreview(): Promise<void> {
 
 async function gotoStep(target: number): Promise<void> {
   if (target === 3 && !canSubmit.value) {
-    if (errors.value.length > 0) {
-      toast.warning('还不能提交', errors.value.map((issue) => issue.message));
-      return;
-    }
     if (items.value.length === 0) {
       toast.warning('清单是空的', ['请先在第 1 步加入至少一门课程。']);
+      return;
+    }
+    if (errors.value.length > 0) {
+      toast.warning('还不能提交', errors.value.map((issue) => issue.message));
       return;
     }
     if (overLimit.value) {
@@ -683,10 +710,10 @@ async function gotoStep(target: number): Promise<void> {
     }
   }
   step.value = target;
-  if (target === 3) await runPreview();
   if (target === 2 && items.value.length > 0) {
     await Promise.all(items.value.map((item) => loadClasses(item.courseId)));
   }
+  if (target === 3) await runPreview();
 }
 
 /* ------------------------------ 提交与撤回 ------------------------------ */
@@ -778,29 +805,30 @@ function demandInfo(courseId: number): { tone: 'critical' | 'warn' | 'muted'; la
   const hint = validation.value?.demandHints.find((row) => row.courseId === courseId);
   if (hint) {
     const reason = hint.reasons.find((r) => r.trim().length > 0) ?? '';
-    const labels: Record<string, string> = { D2: '本期必须完成', D1: '建议补足', D0: '兴趣课程' };
-    return { tone: demandTone(hint.demandLevel), label: labels[hint.demandLevel] ?? '—', detail: reason };
+    return { tone: demandTone(hint.demandLevel), label: demandLabelOf(hint.demandLevel), detail: reason };
   }
-  return { tone: 'muted', label: '待检查', detail: '进入预演后给出培养需求说明' };
+  return { tone: 'muted', label: '待检查', detail: '进入第 3 步后给出培养需求说明' };
 }
 
-/** 成员课程的需求说明（备用组内） */
-function memberDemandInfo(courseId: number): { tone: 'critical' | 'warn' | 'muted'; label: string } {
+function demandLabelOf(level: string): string {
+  if (level === 'D2') return '本期必须完成';
+  if (level === 'D1') return '建议补足';
+  return '兴趣课程';
+}
+
+function demandBadgeClass(tone: 'critical' | 'warn' | 'muted'): string {
+  if (tone === 'critical') return 'badge badge--danger';
+  if (tone === 'warn') return 'badge badge--warn';
+  return 'badge badge--muted';
+}
+
+function memberDemand(courseId: number): { tone: 'critical' | 'warn' | 'muted'; label: string } {
   const attempt = attemptFor(courseId);
   if (attempt) {
     const [label] = attempt.demandText.split(' · ');
     return { tone: demandTone(attempt.demandLevel), label };
   }
   return { tone: 'muted', label: '备选' };
-}
-
-function availabilityFor(courseId: number): string {
-  const attempt = attemptFor(courseId);
-  if (attempt) {
-    return `开放教学班余量 ${attempt.courseAvailable}`;
-  }
-  const row = validation.value?.availability.find((item) => item.courseId === courseId);
-  return row ? `开放教学班 ${row.openClasses} 个 · 余量 ${row.totalAvailable}` : '';
 }
 
 function issuesForCourse(courseId: number): ValidationIssue[] {
@@ -839,7 +867,7 @@ onMounted(loadBatches);
     </p>
     <p v-else-if="!loading && batchId === null" class="alert alert--warning">请先在上方选择一个批次。</p>
 
-    <!-- 批次状态条 -->
+    <!-- 批次状态 -->
     <section v-if="batch" class="card">
       <div class="inline">
         <span class="badge badge--muted">{{ batch.name }}</span>
@@ -847,6 +875,10 @@ onMounted(loadBatches);
         <span class="badge">学分上限 {{ formatCredits(batch.creditLimit) }}</span>
         <span class="badge">开放 {{ formatDateTime(batch.openAt) }}</span>
         <span class="badge">截止 {{ formatDateTime(batch.closeAt) }}</span>
+        <span class="spacer"></span>
+        <span v-if="payload?.view.status === 'submitted'" class="badge badge--ok">已提交 v{{ payload.view.versionNo }}</span>
+        <span v-else-if="payload?.view.status === 'withdrawn'" class="badge badge--muted">已撤回</span>
+        <span v-else class="badge badge--warn">尚未提交</span>
       </div>
       <p v-if="!canEdit" class="alert alert--warning" style="margin-top: 10px">
         当前批次状态为「{{ batchStatusLabel(batch.status) }}」，只有「预览开放」与「正式受理」阶段可以修改并提交志愿。
@@ -854,21 +886,16 @@ onMounted(loadBatches);
       <p v-if="!batch.configReady" class="alert alert--warning" style="margin-top: 8px">
         批次必需配置缺失：{{ batch.configIssues.join('；') }}
       </p>
-      <div class="inline" style="margin-top: 10px">
+      <div class="inline" style="margin-top: 8px">
         <span class="muted small">
           草稿：{{ dirty ? '有未保存修改（自动保存中）' : saving ? '保存中…' : '已同步' }} · 最近保存
           {{ formatDateTime(lastSavedAt) }}
         </span>
-        <span v-if="payload?.view.status === 'submitted'" class="badge badge--ok">
-          已提交 v{{ payload.view.versionNo }}
-        </span>
-        <span v-else-if="payload?.view.status === 'withdrawn'" class="badge badge--muted">已撤回</span>
-        <span v-else class="badge badge--warn">尚未提交</span>
       </div>
       <div v-if="draftDiff.changed" class="alert alert--warning" style="margin-top: 10px">
         <strong>草稿与已提交版本（v{{ payload?.view.versionNo }}）不一致——未提交的修改不会参与本轮分配</strong>
         <ul>
-          <li v-for="row in draftDiff.rows" :key="`${row.courseId}-${row.kind}`">{{ row.courseName }}：{{ row.detail }}</li>
+          <li v-for="row in draftDiff.rows" :key="row.courseId">{{ row.courseName }}：{{ row.detail }}</li>
         </ul>
       </div>
     </section>
@@ -901,78 +928,67 @@ onMounted(loadBatches);
       </div>
 
       <div class="grid grid--2">
-        <div class="stack">
-          <div class="card card--flat">
-            <h4 class="card__title">课程检索</h4>
-            <div class="inline">
-              <input
-                v-model="courseSearchKeyword"
-                class="input"
-                type="text"
-                placeholder="课程名或课程号"
-                @keyup.enter="searchCourses"
-              />
-              <button class="btn btn--primary btn--sm" type="button" :disabled="searchingCourses" @click="searchCourses">
-                {{ searchingCourses ? '搜索中…' : '搜索' }}
-              </button>
-            </div>
-            <p v-if="courseSearchResults.length === 0" class="muted small" style="margin-top: 8px">
-              输入关键词后回车即可搜索。
-            </p>
-            <div v-else class="list" style="margin-top: 8px">
-              <div v-for="course in courseSearchResults" :key="course.id" class="list__item">
-                <div class="inline">
-                  <span class="mono small">{{ course.code }}</span>
-                  <span>{{ course.name }}</span>
-                  <span class="badge">{{ formatCredits(course.credits) }} 学分</span>
-                  <span class="spacer"></span>
-                  <button
-                    class="btn btn--sm btn--primary"
-                    type="button"
-                    :disabled="inDraft(course.id)"
-                    @click="addCourse(course)"
-                  >
-                    {{ inDraft(course.id) ? '已在清单' : '加入' }}
-                  </button>
-                </div>
+        <div class="card card--flat">
+          <h4 class="card__title">课程检索</h4>
+          <div class="inline">
+            <input
+              v-model="courseSearchKeyword"
+              class="input"
+              type="text"
+              placeholder="课程名或课程号"
+              @keyup.enter="searchCourses"
+            />
+            <button class="btn btn--primary btn--sm" type="button" :disabled="searchingCourses" @click="searchCourses">
+              {{ searchingCourses ? '搜索中…' : '搜索' }}
+            </button>
+          </div>
+          <p v-if="courseSearchResults.length === 0" class="muted small" style="margin-top: 8px">
+            输入关键词后回车即可搜索。
+          </p>
+          <div v-else class="list" style="margin-top: 8px">
+            <div v-for="course in courseSearchResults" :key="course.id" class="list__item">
+              <div class="inline">
+                <span class="mono small">{{ course.code }}</span>
+                <span>{{ course.name }}</span>
+                <span class="badge">{{ formatCredits(course.credits) }} 学分</span>
+                <span class="spacer"></span>
+                <button class="btn btn--sm btn--primary" type="button" :disabled="inDraft(course.id)" @click="addCourse(course)">
+                  {{ inDraft(course.id) ? '已在清单' : '加入' }}
+                </button>
               </div>
             </div>
           </div>
         </div>
 
-        <div class="stack">
-          <div class="card card--flat">
-            <div class="card__header">
-              <h4 class="card__title">待排清单（{{ items.length }} 门）</h4>
-              <button class="btn btn--primary btn--sm" type="button" :disabled="items.length === 0" @click="gotoStep(2)">
-                下一步：排顺序
-              </button>
-            </div>
-            <p v-if="items.length === 0" class="muted">还没有加入任何课程。左侧搜索后点“加入”。</p>
-            <div v-else class="list">
-              <div v-for="item in sortedItems()" :key="item.courseId" class="list__item">
-                <div class="inline">
-                  <div style="flex: 1">
-                    <strong>{{ item.courseName }}</strong>
-                    <span class="mono small">{{ item.courseCode }}</span>
-                    <span class="badge">{{ formatCredits(item.credits) }} 学分</span>
-                  </div>
-                  <button class="btn btn--sm btn--danger" type="button" @click="removePreference(items.indexOf(item))">
-                    移除
-                  </button>
+        <div class="card card--flat">
+          <div class="card__header">
+            <h4 class="card__title">待排清单（{{ items.length }} 门）</h4>
+            <button class="btn btn--primary btn--sm" type="button" :disabled="items.length === 0" @click="gotoStep(2)">
+              下一步：排顺序
+            </button>
+          </div>
+          <p v-if="items.length === 0" class="muted">还没有加入任何课程。左侧搜索后点“加入”。</p>
+          <div v-else class="list">
+            <div v-for="(item, index) in sortedItems()" :key="item.courseId" class="list__item">
+              <div class="inline">
+                <div style="flex: 1">
+                  <strong>{{ item.courseName }}</strong>
+                  <span class="mono small">{{ item.courseCode }}</span>
+                  <span class="badge">{{ formatCredits(item.credits) }} 学分</span>
                 </div>
-                <div class="small muted" style="margin-top: 4px">
-                  <span class="badge" :class="`badge--${demandInfo(item.courseId).tone === 'critical' ? 'danger' : demandInfo(item.courseId).tone === 'warn' ? 'warn' : 'muted'}`">
-                    {{ demandInfo(item.courseId).label }}
-                  </span>
-                  {{ demandInfo(item.courseId).detail }}
-                </div>
+                <button class="btn btn--sm btn--danger" type="button" @click="removePreference(index)">移除</button>
+              </div>
+              <div class="small muted" style="margin-top: 4px">
+                <span :class="demandBadgeClass(demandInfo(item.courseId).tone)">
+                  {{ demandInfo(item.courseId).label }}
+                </span>
+                {{ demandInfo(item.courseId).detail }}
               </div>
             </div>
-            <p v-if="overLimit" class="alert alert--error" style="margin-top: 10px">
-              当前合计 {{ formatCredits(totalCredits) }} 学分，已超过上限 {{ formatCredits(creditLimit) }}，请先移除部分课程。
-            </p>
           </div>
+          <p v-if="overLimit" class="alert alert--error" style="margin-top: 10px">
+            当前合计 {{ formatCredits(totalCredits) }} 学分，已超过上限 {{ formatCredits(creditLimit) }}，请先移除部分课程。
+          </p>
         </div>
       </div>
     </section>
@@ -990,7 +1006,7 @@ onMounted(loadBatches);
       </div>
       <p class="tips">
         从上到下的顺序就是“第几志愿”，序号由系统自动生成，不需要手填、也不会重复。
-        拖动左侧的手柄即可调整；`加备选` 表示“这一门选不上时，试试那一门”（组内只会落实一门）。
+        拖动左侧手柄即可调整；「加备选」表示“这一门选不上时，试试那一门”（同一组只会落实一门）。
       </p>
 
       <div v-if="items.length === 0" class="empty">清单是空的，请先回到第 1 步加入课程。</div>
@@ -1000,10 +1016,7 @@ onMounted(loadBatches);
           v-for="(item, index) in sortedItems()"
           :key="item.courseId"
           class="rank-item"
-          :class="{
-            'rank-item--dragging': dragIndex === index,
-            'rank-item--over': dragOverIndex === index,
-          }"
+          :class="{ 'rank-item--dragging': dragIndex === index, 'rank-item--over': dragOverIndex === index }"
           draggable="true"
           @dragstart="onDragStart(index, $event)"
           @dragover="onDragOver(index, $event)"
@@ -1018,12 +1031,7 @@ onMounted(loadBatches);
               <strong>{{ item.courseName }}</strong>
               <span class="mono small">{{ item.courseCode }}</span>
               <span class="badge">{{ formatCredits(item.credits) }} 学分</span>
-              <span
-                class="badge"
-                :class="`badge--${demandInfo(item.courseId).tone === 'critical' ? 'danger' : demandInfo(item.courseId).tone === 'warn' ? 'warn' : 'muted'}`"
-              >
-                {{ demandInfo(item.courseId).label }}
-              </span>
+              <span :class="demandBadgeClass(demandInfo(item.courseId).tone)">{{ demandInfo(item.courseId).label }}</span>
               <span class="spacer"></span>
               <button class="btn btn--sm btn--ghost" type="button" :disabled="index === 0" @click="move(index, -1)">↑</button>
               <button
@@ -1038,34 +1046,32 @@ onMounted(loadBatches);
             <div class="small muted" style="margin-top: 4px">{{ demandInfo(item.courseId).detail }}</div>
 
             <!-- 备选 -->
-            <div v-if="membersOf(item.groupCode ?? '').length > 0" class="alt-list">
+            <div v-if="altsOf(item.courseId).length > 0" class="alt-list">
               <div class="small muted">这一门选不上时，依次尝试：</div>
-              <div v-for="member in membersOf(item.groupCode ?? '')" :key="member.courseId" class="inline" style="margin-top: 4px">
+              <div v-for="alt in altsOf(item.courseId)" :key="alt.courseId" class="inline" style="margin-top: 4px">
                 <span class="alt-list__mark">↳</span>
-                <span>{{ member.courseName }}</span>
-                <span class="mono small">{{ member.courseCode }}</span>
-                <span class="badge">{{ formatCredits(member.credits) }} 学分</span>
-                <span class="badge" :class="`badge--${memberDemandInfo(member.courseId).tone === 'critical' ? 'danger' : memberDemandInfo(member.courseId).tone === 'warn' ? 'warn' : 'muted'}`">
-                  {{ memberDemandInfo(member.courseId).label }}
-                </span>
+                <span>{{ alt.courseName }}</span>
+                <span class="mono small">{{ alt.courseCode }}</span>
+                <span class="badge">{{ formatCredits(alt.credits) }} 学分</span>
+                <span :class="demandBadgeClass(memberDemand(alt.courseId).tone)">{{ memberDemand(alt.courseId).label }}</span>
                 <span class="spacer"></span>
-                <button class="btn btn--sm btn--ghost" type="button" @click="removeAlternative(member)">移除备选</button>
+                <button class="btn btn--sm btn--ghost" type="button" @click="removeAlternative(item.courseId, alt)">移除备选</button>
               </div>
-              <button class="btn btn--sm btn--ghost" type="button" style="margin-top: 4px" @click="dissolveGroup(item.groupCode!)">
+              <button class="btn btn--sm btn--ghost" type="button" style="margin-top: 4px" @click="dissolveGroup(item.courseId)">
                 解散备选关系
               </button>
             </div>
 
             <div class="inline" style="margin-top: 6px">
-              <button class="btn btn--sm btn--ghost" type="button" @click="openAltPicker(index)">
-                {{ altPickerFor === index ? '收起' : '加备选' }}
+              <button class="btn btn--sm btn--ghost" type="button" @click="openAltPicker(item.courseId)">
+                {{ altPickerFor === item.courseId ? '收起' : '加备选' }}
               </button>
               <button class="btn btn--sm btn--ghost" type="button" @click="loadClasses(item.courseId)">教学班偏好</button>
               <button class="btn btn--sm btn--danger" type="button" @click="removePreference(index)">移除</button>
             </div>
 
             <!-- 备选选择器 -->
-            <div v-if="altPickerFor === index" class="card card--flat" style="margin-top: 8px">
+            <div v-if="altPickerFor === item.courseId" class="card card--flat" style="margin-top: 8px">
               <div class="small muted">选一门“这门选不上时想顶上”的课程：</div>
               <div class="inline" style="margin-top: 6px">
                 <input v-model="altKeyword" class="input" type="text" placeholder="课程名或课程号" @keyup.enter="searchAlternatives" />
@@ -1099,7 +1105,7 @@ onMounted(loadBatches);
                 </span>
               </div>
               <div class="inline" style="margin-top: 6px">
-                <select class="select" style="max-width: 420px" @change="onClassSelect(item, $event)">
+                <select class="select" style="max-width: 460px" @change="onClassSelect(item, $event)">
                   <option value="">添加教学班…</option>
                   <option v-for="cls in classCache[item.courseId] ?? []" :key="cls.id" :value="cls.id">
                     {{ cls.classCode }} · {{ cls.sessions.map((s) => s.text).join('；') }} · 余 {{ cls.generalAvailable }}
@@ -1159,15 +1165,13 @@ onMounted(loadBatches);
                 <div class="inline">
                   <span class="rank-item__badge">{{ attempt.rank }}</span>
                   <strong>{{ attempt.courseName }}</strong>
-                  <span class="badge" :class="previewStatusClass(attempt.status)">
-                    {{ previewStatusLabel(attempt.status) }}
-                  </span>
+                  <span :class="previewStatusClass(attempt.status)">{{ previewStatusLabel(attempt.status) }}</span>
                   <span v-if="attempt.classCode" class="mono small">{{ attempt.classCode }}</span>
                 </div>
                 <div class="small" style="margin-top: 4px">{{ attempt.reason }}</div>
                 <div v-if="attempt.conflictText" class="small muted" style="margin-top: 2px">{{ attempt.conflictText }}</div>
-                <div v-if="attempt.status !== 'feasible'" class="small muted" style="margin-top: 2px">
-                  可选教学班：{{ attempt.optionTexts.slice(0, 3).join('；') || '无' }}
+                <div v-if="attempt.status !== 'feasible' && attempt.optionTexts.length > 0" class="small muted" style="margin-top: 2px">
+                  可选教学班：{{ attempt.optionTexts.slice(0, 3).join('；') }}
                 </div>
               </li>
             </ol>
@@ -1185,11 +1189,9 @@ onMounted(loadBatches);
         <div class="stack" style="gap: 2px">
           <strong>
             共 {{ items.length }} 门课程，计划 {{ formatCredits(totalCredits) }} 学分
-            <span v-if="creditLimit !== null">（上限 {{ formatCredits(creditLimit) }}）</span>
+            <template v-if="creditLimit !== null">（上限 {{ formatCredits(creditLimit) }}）</template>
           </strong>
-          <span v-if="dirty" class="small" style="color: var(--color-warn, #b45309)">
-            草稿还有未保存的修改，建议先保存再提交
-          </span>
+          <span v-if="dirty" class="small submit-bar__warn">草稿还有未保存的修改，建议先保存再提交</span>
           <span v-else class="small muted">草稿已同步</span>
         </div>
         <span class="spacer"></span>
@@ -1336,7 +1338,7 @@ onMounted(loadBatches);
   align-items: center;
   gap: 8px;
   padding: 8px 14px;
-  border: 1px solid var(--color-border, #d8dce5);
+  border: 1px solid #d8dce5;
   border-radius: 999px;
   background: #fff;
   color: inherit;
@@ -1345,13 +1347,13 @@ onMounted(loadBatches);
 }
 
 .wizard-steps__item--active {
-  border-color: var(--color-primary, #2563eb);
-  background: var(--color-primary, #2563eb);
+  border-color: #2563eb;
+  background: #2563eb;
   color: #fff;
 }
 
 .wizard-steps__item--done {
-  border-color: var(--color-ok, #16a34a);
+  border-color: #16a34a;
 }
 
 .wizard-steps__index {
@@ -1384,7 +1386,7 @@ onMounted(loadBatches);
   align-items: flex-start;
   gap: 10px;
   padding: 10px 12px;
-  border: 1px solid var(--color-border, #d8dce5);
+  border: 1px solid #d8dce5;
   border-radius: 10px;
   background: #fff;
 }
@@ -1394,7 +1396,7 @@ onMounted(loadBatches);
 }
 
 .rank-item--over {
-  border-color: var(--color-primary, #2563eb);
+  border-color: #2563eb;
   box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.18);
 }
 
@@ -1448,7 +1450,7 @@ onMounted(loadBatches);
 
 .attempt-item {
   padding: 8px 10px;
-  border: 1px solid var(--color-border, #d8dce5);
+  border: 1px solid #d8dce5;
   border-radius: 8px;
   background: #fff;
 }
@@ -1459,9 +1461,14 @@ onMounted(loadBatches);
   gap: 10px;
   margin-top: 14px;
   padding: 12px;
-  border: 1px solid var(--color-border, #d8dce5);
+  border: 1px solid #d8dce5;
   border-radius: 10px;
   background: #f8fafc;
   flex-wrap: wrap;
 }
+
+.submit-bar__warn {
+  color: #b45309;
+}
 </style>
+
