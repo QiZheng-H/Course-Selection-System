@@ -13,7 +13,17 @@ import { AppError, ERROR_CODES, notFound } from '../../core/errors.js';
 import { contentHash, deriveRandomKey, nowIso, stableStringify } from '../../core/utils.js';
 import { writeAudit } from '../../core/audit.js';
 import type { AuthUser } from '../../core/context.js';
-import { assessDemand, type SubstituteGroup } from '../rules/service.js';
+import {
+  assessDemand,
+  getCreditLimit,
+  keysIntersect,
+  loadStudentSchedule,
+  occupancyKeys,
+  type ClassSchedule,
+  type SubstituteGroup,
+} from '../rules/service.js';
+import { findConflicts, describeSession, describeWeeks } from '../../core/time.js';
+import { getSeatUsage } from '../catalog/service.js';
 
 export interface DraftPreferenceInput {
   courseId: number;
@@ -319,6 +329,26 @@ export function validateDraft(db: SqliteDb, studentId: number, _batchId: number,
 }
 
 /**
+ * 决定替代组的插入顺序。
+ * preference_group_courses.group_id 外键指向 preference_groups，因此“组”必须比引用它的
+ * 课程记录先插入。返回的顺序保证：被引用的组一定排在引用它的组之前（组不嵌套时即为原顺序）。
+ */
+function orderedGroupsForInsert(
+  groups: DraftGroupInput[],
+  preferences: DraftPreferenceInput[],
+): DraftGroupInput[] {
+  if (groups.length <= 1) return groups;
+  // 组之间目前没有层级关系，只需保证每个被课程引用的 code 都存在即可。
+  // 这里把“被引用次数多的组”排在前面，作为对将来引入组嵌套时的稳定默认顺序。
+  const usage = new Map<string, number>();
+  for (const pref of preferences) {
+    if (!pref.groupCode) continue;
+    usage.set(pref.groupCode, (usage.get(pref.groupCode) ?? 0) + 1);
+  }
+  return [...groups].sort((a, b) => (usage.get(b.code) ?? 0) - (usage.get(a.code) ?? 0));
+}
+
+/**
  * 提交 / 撤回的时间与状态校验。
  * 关键点：截止判断使用服务器时间与管理员配置的开放/截止时刻，
  * 不能依赖“管理员恰好在截止时点了冻结”。
@@ -436,7 +466,9 @@ export function submitPreferences(
     );
 
     const groupIdByCode = new Map<string, number>();
-    for (const group of payload.groups ?? []) {
+    // 依赖顺序显式化：同一替代组先插入“所有组”，再插入组内课程与志愿。
+    // 这样前端把志愿排成任何顺序（例如把备选课程拖到成员前面）都不会撞外键约束。
+    for (const group of orderedGroupsForInsert(payload.groups ?? [], validation.normalized)) {
       const groupInfo = db
         .prepare('INSERT INTO preference_groups (submission_id, code, name, rank_hint, note) VALUES (?, ?, ?, ?, ?)')
         .run(
@@ -736,6 +768,609 @@ export function pendingConfirmations(db: SqliteDb, batchId: number): Array<{ stu
     )
     .all(batchId) as Array<{ studentId: number; studentNo: string; name: string }>;
   return rows;
+}
+
+// ---------------------------------------------------------------------------
+// 志愿预演（只读）
+// ---------------------------------------------------------------------------
+
+/**
+ * 志愿预演的结论。
+ *   feasible   按当前名额，这门课能排进课表
+ *   conflict   与已排定的更高偏好志愿时间冲突（必须取舍）
+ *   no_seat    所有教学班都没有普通余量
+ *   over_limit 排进后总学分超上限
+ *   no_class   本学期没有开放的教学班
+ */
+export type PreviewStatus = 'feasible' | 'conflict' | 'no_seat' | 'over_limit' | 'no_class';
+
+export interface PreviewAttempt {
+  rank: number;
+  courseId: number;
+  courseName: string;
+  courseCode: string;
+  credits: number;
+  groupCode: string | null;
+  demandLevel: 'D2' | 'D1' | 'D0';
+  /** 面向学生的一句话需求说明（由后端翻译，前端不显示 D 级字母） */
+  demandText: string;
+  status: PreviewStatus;
+  reason: string;
+  /** 预计会落实的教学班 */
+  classId: number | null;
+  classCode: string | null;
+  /** 该教学班当前普通余量与总余量 */
+  generalAvailable: number;
+  totalAvailable: number;
+  /** 本课程所有开放教学班的合计余量 */
+  courseAvailable: number;
+  /** 冲突对象：排名更靠前的第几志愿 */
+  conflictRank: number | null;
+  conflictCourseName: string | null;
+  /** 冲突发生的具体时段文案 */
+  conflictText: string | null;
+  /** 所有开放教学班的时段文案，便于学生换班 */
+  optionTexts: string[];
+  isSubstitute: boolean;
+}
+
+export interface PreferencePreview {
+  batchId: number;
+  credits: number;
+  creditLimit: number;
+  baseCredits: number;
+  plannedCredits: number;
+  overLimit: boolean;
+  /** 整份志愿全部落实后的课表（只含可落实的志愿 + 已落实的正式选课） */
+  entries: Array<{
+    id: string | number;
+    title: string;
+    subtitle: string | null;
+    source: string | null;
+    credits: number | null;
+    sessions: Array<{
+      dayOfWeek: number;
+      periodStart: number;
+      periodEnd: number;
+      weekStart: number;
+      weekEnd: number;
+      weekParity: string;
+      room: string | null;
+      text: string;
+    }>;
+  }>;
+  attempts: PreviewAttempt[];
+  summary: {
+    total: number;
+    feasible: number;
+    conflict: number;
+    noSeat: number;
+    overLimit: number;
+    noClass: number;
+  };
+  notes: string[];
+}
+
+interface ClassOption {
+  classId: number;
+  courseId: number;
+  classCode: string;
+  courseCode: string;
+  courseName: string;
+  credits: number;
+  sessions: ClassSchedule['sessions'];
+  generalAvailable: number;
+  totalAvailable: number;
+}
+
+const EMPTY_SEAT = { generalAvailable: 0, totalAvailable: 0 };
+
+function loadClassOptions(db: SqliteDb, term: string): Map<number, ClassOption[]> {
+  const rows = db
+    .prepare(
+      `SELECT tc.id AS classId, tc.course_id AS courseId, tc.class_code AS classCode,
+              c.code AS courseCode, c.name AS courseName, c.credits
+       FROM teaching_classes tc JOIN courses c ON c.id = tc.course_id
+       WHERE tc.term = ? AND tc.status = 'open' ORDER BY tc.id`,
+    )
+    .all(term) as Array<{
+    classId: number;
+    courseId: number;
+    classCode: string;
+    courseCode: string;
+    courseName: string;
+    credits: number;
+  }>;
+  const byCourse = new Map<number, ClassOption[]>();
+  if (rows.length === 0) return byCourse;
+
+  const placeholders = rows.map(() => '?').join(',');
+  const sessionRows = db
+    .prepare(
+      `SELECT id, class_id, day_of_week, period_start, period_end, week_start, week_end, week_parity, room
+       FROM class_sessions WHERE class_id IN (${placeholders}) ORDER BY day_of_week, period_start`,
+    )
+    .all(...rows.map((r) => r.classId)) as Array<{
+    id: number;
+    class_id: number;
+    day_of_week: number;
+    period_start: number;
+    period_end: number;
+    week_start: number;
+    week_end: number;
+    week_parity: string;
+    room: string | null;
+  }>;
+  const sessionsByClass = new Map<number, ClassSchedule['sessions']>();
+  for (const row of sessionRows) {
+    const list = sessionsByClass.get(row.class_id) ?? [];
+    list.push({
+      id: row.id,
+      day_of_week: row.day_of_week,
+      period_start: row.period_start,
+      period_end: row.period_end,
+      week_start: row.week_start,
+      week_end: row.week_end,
+      week_parity: row.week_parity,
+      room: row.room,
+    });
+    sessionsByClass.set(row.class_id, list);
+  }
+
+  for (const row of rows) {
+    const seat = getSeatUsage(db, row.classId);
+    const option: ClassOption = {
+      classId: row.classId,
+      courseId: row.courseId,
+      classCode: row.classCode,
+      courseCode: row.courseCode,
+      courseName: row.courseName,
+      credits: row.credits,
+      sessions: sessionsByClass.get(row.classId) ?? [],
+      generalAvailable: seat.generalAvailable,
+      totalAvailable: seat.totalAvailable,
+    };
+    const list = byCourse.get(row.courseId) ?? [];
+    list.push(option);
+    byCourse.set(row.courseId, list);
+  }
+  return byCourse;
+}
+
+/**
+ * 志愿预演：只读计算，不写任何数据。
+ *
+ * 它模拟“如果这些志愿按你的顺序依次落实”，用来回答学生最关心的三个问题：
+ *   1) 我的课表会是什么样；
+ *   2) 哪一门排不进去、被谁挡住了；
+ *   3) 一共多少学分、会不会超。
+ *
+ * 它**不预测中签概率**：统一分配还要经过“培养需求 → 志愿排名 → 固定随机键”的竞争，
+ * 提交先后不影响结果，因此界面文案不能承诺“你会选上”。
+ */
+export function previewDraft(
+  db: SqliteDb,
+  studentId: number,
+  batchId: number,
+  payload: DraftPayload,
+): PreferencePreview {
+  const batch = db.prepare('SELECT id, term FROM selection_batches WHERE id = ?').get(batchId) as
+    | { id: number; term: string }
+    | undefined;
+  if (!batch) throw notFound('批次不存在');
+
+  const preferences = [...(payload.preferences ?? [])]
+    .filter((p) => Number.isInteger(p.courseId))
+    .sort((a, b) => a.globalRank - b.globalRank);
+  const groupCodeOf = new Map<number, string>();
+  for (const pref of preferences) {
+    if (pref.groupCode) groupCodeOf.set(pref.courseId, pref.groupCode);
+  }
+
+  const classesByCourse = loadClassOptions(db, batch.term);
+  const existing = loadStudentSchedule(db, studentId);
+  const creditLimit = getCreditLimit(db, studentId);
+  const baseCourseIds = new Set(existing.map((e) => e.courseId));
+  const baseCredits = existing.reduce((sum, item) => sum + item.credits, 0);
+
+  // 占用键 → 来源。来源用于把“排不进去”归因到具体是谁挡住了它：
+  // null 表示已落实的正式选课，数字表示排在前面的第几志愿。
+  const occupancy = new Map<string, number | null>();
+  for (const item of existing) {
+    for (const key of occupancyKeys(item.sessions)) occupancy.set(key, null);
+  }
+
+  const demand = assessDemand(db, studentId, preferences.map((p) => p.courseId));
+  const courseInfoRows =
+    preferences.length > 0
+      ? (db
+          .prepare(
+            `SELECT id, code, name, credits FROM courses WHERE id IN (${preferences
+              .map(() => '?')
+              .join(',')})`,
+          )
+          .all(...preferences.map((p) => p.courseId)) as Array<{
+          id: number;
+          code: string;
+          name: string;
+          credits: number;
+        }>)
+      : [];
+  const courseInfo = new Map(courseInfoRows.map((c) => [c.id, c]));
+
+  const picks: Array<{ option: ClassOption; rank: number; groupCode: string | null; demandLevel: PreviewAttempt['demandLevel'] }> = [];
+  const attempts: PreviewAttempt[] = [];
+  const notes: string[] = [];
+
+  // 替代组：组内最多落实一门。前一个成员成功排定后，后面成员直接判为“组内已落实”。
+  const fulfilledGroups = new Map<string, number>();
+  const plannedCourseIds = new Set<number>();
+
+  const rankOf = new Map<number, number>();
+  preferences.forEach((pref, index) => rankOf.set(pref.courseId, index + 1));
+
+  const optionText = (option: ClassOption): string =>
+    option.sessions.length === 0
+      ? `${option.classCode}（时段待定）`
+      : `${option.classCode} ${option.sessions.map((s) => describeSession(s)).join('、')}`;
+
+  for (const pref of preferences) {
+    const info = courseInfo.get(pref.courseId);
+    const rank = rankOf.get(pref.courseId) ?? 0;
+    const assessment = demand.get(pref.courseId);
+    const demandLevel = assessment?.demandLevel ?? 'D0';
+    const options = classesByCourse.get(pref.courseId) ?? [];
+    const courseAvailable = options.reduce((sum, o) => sum + o.generalAvailable, 0);
+    // 教学班顺序：学生填写的偏好在前，其余按班号
+    const ordered = [
+      ...(pref.classIds ?? []).map((id) => options.find((o) => o.classId === id)).filter((o): o is ClassOption => Boolean(o)),
+      ...options.filter((o) => !(pref.classIds ?? []).includes(o.classId)),
+    ];
+
+    const base = {
+      rank,
+      courseId: pref.courseId,
+      courseName: info?.name ?? String(pref.courseId),
+      courseCode: info?.code ?? '—',
+      credits: info?.credits ?? 0,
+      groupCode: groupCodeOf.get(pref.courseId) ?? null,
+      demandLevel,
+      demandText: describeDemand(assessment?.demandLevel ?? 'D0', assessment?.reasons ?? [], info?.name ?? ''),
+      courseAvailable,
+      optionTexts: ordered.map(optionText),
+    };
+
+    if (baseCourseIds.has(pref.courseId)) {
+      attempts.push({
+        ...base,
+        status: 'feasible',
+        reason: '已有该课程的有效记录，本轮不会重复落实',
+        classId: null,
+        classCode: null,
+        generalAvailable: 0,
+        totalAvailable: 0,
+        conflictRank: null,
+        conflictCourseName: null,
+        conflictText: null,
+        isSubstitute: false,
+      });
+      continue;
+    }
+    if (plannedCourseIds.has(pref.courseId)) {
+      attempts.push({
+        ...base,
+        status: 'conflict',
+        reason: '同一门课程在志愿里重复出现，只会按最高排名落实一次',
+        classId: null,
+        classCode: null,
+        generalAvailable: 0,
+        totalAvailable: 0,
+        conflictRank: null,
+        conflictCourseName: null,
+        conflictText: null,
+        isSubstitute: false,
+      });
+      continue;
+    }
+    const groupCode = base.groupCode;
+    if (groupCode && fulfilledGroups.has(groupCode)) {
+      attempts.push({
+        ...base,
+        status: 'conflict',
+        reason: `备选组「${groupCode}」已由第 ${fulfilledGroups.get(groupCode)} 志愿落实，组内只落实一门`,
+        classId: null,
+        classCode: null,
+        generalAvailable: 0,
+        totalAvailable: 0,
+        conflictRank: fulfilledGroups.get(groupCode) ?? null,
+        conflictCourseName: null,
+        conflictText: null,
+        isSubstitute: true,
+      });
+      continue;
+    }
+    if (ordered.length === 0) {
+      attempts.push({
+        ...base,
+        status: 'no_class',
+        reason: '本学期没有开放的教学班',
+        classId: null,
+        classCode: null,
+        generalAvailable: 0,
+        totalAvailable: 0,
+        conflictRank: null,
+        conflictCourseName: null,
+        conflictText: null,
+        isSubstitute: false,
+      });
+      continue;
+    }
+
+    // 逐个教学班尝试：只要有一个能排进课表，这门志愿就是可行的。
+    // 同时记录“因为什么被跳过”，用于在没有班可用时给出准确原因。
+    let chosen: ClassOption | null = null;
+    let blockedBy: { rank: number | null; option: ClassOption } | null = null;
+    let seatRoom = false;
+    let timeRoom = false;
+    let creditRoom = false;
+    for (const option of ordered) {
+      const tooManyCredits = baseCredits + plannedCredits(picks) + option.credits > creditLimit;
+      if (!tooManyCredits) creditRoom = true;
+      // 名额不足与时间冲突的差别是“等得到”与“等不到”，因此先判名额
+      if (option.totalAvailable <= 0 || option.generalAvailable <= 0) continue;
+      seatRoom = true;
+      if (option.sessions.length === 0) {
+        // 时段待定的教学班：没有时段就无法判断冲突。教务排定时间后可重新提交，
+        // 这里既不当成错误，也不占用课表格子。
+        chosen = option;
+        break;
+      }
+      const optionKeys = occupancyKeys(option.sessions);
+      if (keysIntersect(new Set(occupancy.keys()), optionKeys)) {
+        if (!blockedBy) blockedBy = { rank: blockingRank(occupancy, optionKeys), option };
+        continue;
+      }
+      timeRoom = true;
+      if (tooManyCredits) continue;
+      chosen = option;
+      break;
+    }
+
+    if (chosen) {
+      for (const key of occupancyKeys(chosen.sessions)) occupancy.set(key, rank);
+      plannedCourseIds.add(chosen.courseId);
+      picks.push({ option: chosen, rank, groupCode, demandLevel });
+      if (groupCode) fulfilledGroups.set(groupCode, rank);
+      attempts.push({
+        ...base,
+        status: 'feasible',
+        reason:
+          chosen.sessions.length === 0
+            ? `${chosen.classCode} 的时段尚未排定，先按该班登记`
+            : `可排入课表（${chosen.classCode}，普通余量 ${chosen.generalAvailable}）`,
+        classId: chosen.classId,
+        classCode: chosen.classCode,
+        generalAvailable: chosen.generalAvailable,
+        totalAvailable: chosen.totalAvailable,
+        conflictRank: null,
+        conflictCourseName: null,
+        conflictText: null,
+        isSubstitute: false,
+      });
+      continue;
+    }
+
+    // 排不进去：按“时间冲突 → 名额 → 学分 → 其它”给出最贴近实际的原因
+    if (blockedBy && !timeRoom) {
+      const blockerName =
+        blockedBy.rank === null
+          ? '你已选上的课程'
+          : `第 ${blockedBy.rank} 志愿「${courseInfo.get(blockedBy.option.courseId)?.name ?? blockedBy.option.courseName}」`;
+      attempts.push({
+        ...base,
+        status: 'conflict',
+        reason:
+          blockedBy.rank === null
+            ? '与你已选上的课程时间冲突，要选它需要先调整已选课程'
+            : `与${blockerName}时间冲突，要选它就得放弃那一门`,
+        classId: null,
+        classCode: null,
+        generalAvailable: blockedBy.option.generalAvailable,
+        totalAvailable: blockedBy.option.totalAvailable,
+        conflictRank: blockedBy.rank,
+        conflictCourseName: blockedBy.rank === null ? null : blockedBy.option.courseName,
+        conflictText: firstConflictText(blockedBy.option, blockedBy.rank, picks, existing),
+        isSubstitute: false,
+      });
+      continue;
+    }
+
+    if (!seatRoom) {
+      attempts.push({
+        ...base,
+        status: 'no_seat',
+        reason: `所有教学班的普通名额都已用完（含毕业预留共余 ${ordered.reduce((s, o) => s + o.totalAvailable, 0)}）`,
+        classId: null,
+        classCode: null,
+        generalAvailable: 0,
+        totalAvailable: 0,
+        conflictRank: null,
+        conflictCourseName: null,
+        conflictText: null,
+        isSubstitute: false,
+      });
+      continue;
+    }
+
+    if (!creditRoom) {
+      attempts.push({
+        ...base,
+        status: 'over_limit',
+        reason: `排入后总学分将达到 ${baseCredits + plannedCredits(picks) + base.credits}，超过上限 ${creditLimit}`,
+        classId: null,
+        classCode: null,
+        generalAvailable: 0,
+        totalAvailable: 0,
+        conflictRank: null,
+        conflictCourseName: null,
+        conflictText: null,
+        isSubstitute: false,
+      });
+      continue;
+    }
+
+    attempts.push({
+      ...base,
+      status: 'conflict',
+      reason: '现有教学班都排不进当前课表，可尝试调整教学班偏好',
+      classId: null,
+      classCode: null,
+      generalAvailable: ordered[0]?.generalAvailable ?? 0,
+      totalAvailable: ordered[0]?.totalAvailable ?? 0,
+      conflictRank: null,
+      conflictCourseName: null,
+      conflictText: null,
+      isSubstitute: false,
+    });
+  }
+
+  // 课表条目：已落实的正式选课 + 本次可排入的志愿
+  const entries: PreferencePreview['entries'] = [
+    ...existing.map((item) => ({
+      id: `enrolled-${item.classId}`,
+      title: item.courseName,
+      subtitle: `${item.classCode} · 已选`,
+      source: '已选',
+      credits: item.credits,
+      sessions: item.sessions.map((s) => ({
+        dayOfWeek: s.day_of_week,
+        periodStart: s.period_start,
+        periodEnd: s.period_end,
+        weekStart: s.week_start,
+        weekEnd: s.week_end,
+        weekParity: s.week_parity,
+        room: s.room,
+        text: describeSession(s),
+      })),
+    })),
+    ...picks.map((pick) => ({
+      id: `pref-${pick.option.classId}`,
+      title: pick.option.courseName,
+      subtitle: `${pick.option.classCode} · 第 ${pick.rank} 志愿`,
+      source: '志愿',
+      credits: pick.option.credits,
+      sessions: pick.option.sessions.map((s) => ({
+        dayOfWeek: s.day_of_week,
+        periodStart: s.period_start,
+        periodEnd: s.period_end,
+        weekStart: s.week_start,
+        weekEnd: s.week_end,
+        weekParity: s.week_parity,
+        room: s.room,
+        text: describeSession(s),
+      })),
+    })),
+  ];
+
+  const planned = plannedCredits(picks);
+  const summary = {
+    total: attempts.length,
+    feasible: attempts.filter((a) => a.status === 'feasible').length,
+    conflict: attempts.filter((a) => a.status === 'conflict').length,
+    noSeat: attempts.filter((a) => a.status === 'no_seat').length,
+    overLimit: attempts.filter((a) => a.status === 'over_limit').length,
+    noClass: attempts.filter((a) => a.status === 'no_class').length,
+  };
+
+  notes.push('预演只说明“按当前名额能不能排进课表”，不代表最终结果。');
+  notes.push('最终结果由统一分配按「培养需求 → 志愿排名 → 固定随机键」决定，提交先后不影响结果。');
+  if (summary.overLimit > 0) notes.push('请调整学分超限的志愿，否则对应课程不会落实。');
+  if (summary.conflict > 0) notes.push('冲突的志愿之间需要取舍：把更想上的那门排在前面。');
+
+  return {
+    batchId,
+    credits: baseCredits + planned,
+    creditLimit,
+    baseCredits,
+    plannedCredits: planned,
+    overLimit: baseCredits + planned > creditLimit,
+    entries,
+    attempts,
+    summary,
+    notes,
+  };
+}
+
+function plannedCredits(picks: Array<{ option: { credits: number } }>): number {
+  return picks.reduce((sum, item) => sum + item.option.credits, 0);
+}
+
+/**
+ * 把培养需求等级翻译成学生能直接看懂的一句话。
+ * 界面上不出现 D2 / D1 / D0 字母——那是系统内部的排序依据，不是给人看的。
+ */
+function describeDemand(level: 'D2' | 'D1' | 'D0', reasons: string[], courseName: string): string {
+  const detail = reasons.find((r) => r.trim().length > 0) ?? '';
+  if (level === 'D2') {
+    return detail ? `本期必须完成 · ${detail}` : `本期必须完成 · ${courseName}`;
+  }
+  if (level === 'D1') {
+    return detail ? `建议补足 · ${detail}` : '建议补足未完成的必修或类别学分';
+  }
+  return detail ? `兴趣 / 已有安排 · ${detail}` : '兴趣课程，培养方案已满足';
+}
+
+/** 找出挡住某个教学班的、排名最靠前的志愿（null 表示挡路的是已落实的正式选课） */
+function blockingRank(occupancy: Map<string, number | null>, optionKeys: Set<string>): number | null {
+  let best: number | null = null;
+  let hasBase = false;
+  for (const key of optionKeys) {
+    if (!occupancy.has(key)) continue;
+    const rank = occupancy.get(key);
+    if (rank === null || rank === undefined) {
+      hasBase = true;
+      continue;
+    }
+    if (best === null || rank < best) best = rank;
+  }
+  // 已落实的正式选课不可被志愿挤掉，优先归因给它
+  return hasBase ? null : best;
+}
+
+/** 给出冲突的具体时段文案（面向学生，能直接看懂是哪两节课撞了） */
+function firstConflictText(
+  option: ClassOption,
+  rank: number | null,
+  picks: Array<{ option: ClassOption; rank: number }>,
+  existing: ClassSchedule[],
+): string {
+  const candidates: ClassSchedule[] = [];
+  if (rank !== null) {
+    const pick = picks.find((p) => p.rank === rank);
+    if (pick) candidates.push(toScheduleLike(pick.option));
+  } else {
+    candidates.push(...existing);
+  }
+  for (const other of candidates) {
+    const pairs = findConflicts(option.sessions, other.sessions);
+    if (pairs.length > 0) {
+      const pair = pairs[0];
+      return `${describeSession(pair.left)} 与 ${describeSession(pair.right)} 在${describeWeeks(pair.weeks)}冲突`;
+    }
+  }
+  return '时间冲突';
+}
+
+function toScheduleLike(option: ClassOption): ClassSchedule {
+  return {
+    classId: option.classId,
+    courseId: option.courseId,
+    classCode: option.classCode,
+    courseCode: option.courseCode,
+    courseName: option.courseName,
+    credits: option.credits,
+    sessions: option.sessions,
+  };
 }
 
 export function getRandomKey(db: SqliteDb, studentId: number, courseId: number, term: string): string | null {

@@ -190,8 +190,36 @@ export function sessionText(session: GridSession): string {
 }
 
 export function demandLabel(level: string | null | undefined): string {
-  if (level === 'D2') return 'D2（本期必须完成）';
-  if (level === 'D1') return 'D1（可补足必修/类别学分）';
-  if (level === 'D0') return 'D0（额外兴趣或已有安排）';
+  if (level === 'D2') return '本期必须完成';
+  if (level === 'D1') return '建议补足';
+  if (level === 'D0') return '兴趣课程';
   return '—';
+}
+
+/**
+ * 培养需求的颜色级别。
+ * 只让“本期必须完成”抢眼：如果所有课程都标红，等于没有标记。
+ */
+export function demandTone(level: string | null | undefined): 'critical' | 'warn' | 'muted' {
+  if (level === 'D2') return 'critical';
+  if (level === 'D1') return 'warn';
+  return 'muted';
+}
+
+export const PREVIEW_STATUS_LABEL: Record<string, string> = {
+  feasible: '可排入课表',
+  conflict: '时间冲突',
+  no_seat: '名额已满',
+  over_limit: '超出学分上限',
+  no_class: '本学期未开课',
+};
+
+export function previewStatusLabel(status: string): string {
+  return PREVIEW_STATUS_LABEL[status] ?? status;
+}
+
+export function previewStatusClass(status: string): string {
+  if (status === 'feasible') return 'badge badge--ok';
+  if (status === 'conflict' || status === 'over_limit') return 'badge badge--danger';
+  return 'badge badge--warn';
 }

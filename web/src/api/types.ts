@@ -372,6 +372,66 @@ export interface RandomKeyRow {
   randomKey: string | null;
 }
 
+/* --------------------------- 志愿预演（只读） --------------------------- */
+
+export type PreviewStatus = 'feasible' | 'conflict' | 'no_seat' | 'over_limit' | 'no_class';
+
+export interface PreviewSession {
+  dayOfWeek: number;
+  periodStart: number;
+  periodEnd: number;
+  weekStart: number;
+  weekEnd: number;
+  weekParity: string;
+  room: string | null;
+  text: string;
+}
+
+export interface PreviewAttempt {
+  rank: number;
+  courseId: number;
+  courseName: string;
+  courseCode: string;
+  credits: number;
+  groupCode: string | null;
+  demandLevel: 'D2' | 'D1' | 'D0';
+  /** 后端已翻译好的需求说明，界面直接显示，不展示 D 级字母 */
+  demandText: string;
+  status: PreviewStatus;
+  reason: string;
+  classId: number | null;
+  classCode: string | null;
+  generalAvailable: number;
+  totalAvailable: number;
+  courseAvailable: number;
+  /** 冲突对象：排名更靠前的第几志愿（null 表示挡路的是已选上的课程） */
+  conflictRank: number | null;
+  conflictCourseName: string | null;
+  conflictText: string | null;
+  optionTexts: string[];
+  isSubstitute: boolean;
+}
+
+export interface PreferencePreview {
+  batchId: number;
+  credits: number;
+  creditLimit: number;
+  baseCredits: number;
+  plannedCredits: number;
+  overLimit: boolean;
+  entries: GridEntry[];
+  attempts: PreviewAttempt[];
+  summary: {
+    total: number;
+    feasible: number;
+    conflict: number;
+    noSeat: number;
+    overLimit: number;
+    noClass: number;
+  };
+  notes: string[];
+}
+
 export interface PreferencesPayload {
   batch: BatchDto;
   view: PreferenceView;
