@@ -16,7 +16,8 @@
     "db:seed": "tsx src/db/cli.ts seed",
     "db:reset": "tsx src/db/cli.ts reset",
     "db:status": "tsx src/db/cli.ts status",
-    "demo": "tsx scripts/demo.ts"
+    "demo": "tsx scripts/demo.ts",
+    "import:class": "tsx scripts/import-class-members.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.5.0",
