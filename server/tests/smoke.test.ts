@@ -4,6 +4,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import request from 'supertest';
 import { authHeader, login, setupTestContext, type TestContext } from './helpers.js';
+import { USST_CS_2024_SOURCE, officialCourseCount } from '../src/db/official-plan.js';
 
 let ctx: TestContext;
 
@@ -64,8 +65,59 @@ describe('基础可用性', () => {
     const courses = ctx.db.prepare('SELECT COUNT(*) AS c FROM courses').get() as { c: number };
     const classes = ctx.db.prepare('SELECT COUNT(*) AS c FROM teaching_classes').get() as { c: number };
     const students = ctx.db.prepare('SELECT COUNT(*) AS c FROM students').get() as { c: number };
-    expect(courses.c).toBe(28);
+    // 课程全部来自官方培养计划（见 db/official-plan.ts）
+    expect(courses.c).toBe(officialCourseCount());
     expect(classes.c).toBe(12);
     expect(students.c).toBe(20);
+  });
+
+  it('演示学生绑定官方培养方案，且模拟数据有明确标记', async () => {
+    const program = ctx.db
+      .prepare('SELECT code, name, grade, major, total_credits AS totalCredits, source_url AS sourceUrl, source_pages AS sourcePages FROM programs')
+      .get() as { code: string; name: string; grade: string; major: string; totalCredits: number; sourceUrl: string; sourcePages: string };
+    expect(program.code).toBe(USST_CS_2024_SOURCE.majorCode);
+    expect(program.grade).toBe('2024');
+    expect(program.major).toBe('计算机科学与技术');
+    expect(program.totalCredits).toBe(163.5);
+    expect(program.sourceUrl).toContain('usst.edu.cn');
+    expect(program.sourcePages).toContain('138');
+
+    // 所有学生都绑定该方案
+    const unbound = (
+      ctx.db.prepare('SELECT COUNT(*) AS c FROM students WHERE program_id IS NULL').get() as { c: number }
+    ).c;
+    expect(unbound).toBe(0);
+
+    // 模块学分要求与课程属性来自官方表格
+    const ideology = ctx.db
+      .prepare("SELECT required_credits AS credits, nature, source_pages AS pages FROM curriculum_requirements WHERE code = 'GE-IDEOLOGY'")
+      .get() as { credits: number; nature: string; pages: string };
+    expect(ideology.credits).toBe(17);
+    expect(ideology.nature).toBe('必修');
+
+    const course = ctx.db
+      .prepare('SELECT code, name, credits FROM courses WHERE code = ?')
+      .get('12002920') as { code: string; name: string; credits: number };
+    expect(course.name).toBe('数据结构');
+    expect(course.credits).toBe(3);
+
+    const planCourse = ctx.db
+      .prepare(
+        `SELECT cc.suggested_term AS suggestedTerm, cc.course_nature AS nature
+         FROM curriculum_courses cc JOIN courses c ON c.id = cc.course_id WHERE c.code = '12002920'`,
+      )
+      .get() as { suggestedTerm: string; nature: string };
+    expect(planCourse.suggestedTerm).toBe('二/1');
+    expect(planCourse.nature).toBe('必修');
+
+    // 教师 / 教学班属于演示模拟配置
+    const demoClasses = (
+      ctx.db.prepare('SELECT COUNT(*) AS c FROM teaching_classes WHERE is_demo = 1').get() as { c: number }
+    ).c;
+    const allClasses = (ctx.db.prepare('SELECT COUNT(*) AS c FROM teaching_classes').get() as { c: number }).c;
+    expect(demoClasses).toBe(allClasses);
+    const demoTeachers = (ctx.db.prepare('SELECT COUNT(*) AS c FROM teachers WHERE is_demo = 1').get() as { c: number }).c;
+    const allTeachers = (ctx.db.prepare('SELECT COUNT(*) AS c FROM teachers').get() as { c: number }).c;
+    expect(demoTeachers).toBe(allTeachers);
   });
 });

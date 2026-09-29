@@ -202,25 +202,28 @@ export function transitionBatch(
     }
   }
   if (target === 'published') {
+    // 发布必须由“发布指定的、检查通过的试算结果”完成；这里只确认该事务已经成功执行。
+    // 不允许用通用 force 参数绕过必要校验。
     const run = db
-      .prepare("SELECT id, status FROM allocation_runs WHERE batch_id = ? AND mode = 'publish' ORDER BY attempt DESC LIMIT 1")
+      .prepare(
+        "SELECT id, status FROM allocation_runs WHERE batch_id = ? AND mode IN ('simulate', 'publish') AND status = 'published' ORDER BY id DESC LIMIT 1",
+      )
       .get(batchId) as { id: number; status: string } | undefined;
     if (!run) {
-      throw new AppError(ERROR_CODES.BATCH_STATE_INVALID, '尚未执行发布模式的分配任务，不能发布结果', 409);
-    }
-    const openExceptions = (
-      db
-        .prepare("SELECT COUNT(*) AS c FROM exceptions WHERE batch_id = ? AND status = 'open' AND severity = 'critical'")
-        .get(batchId) as { c: number }
-    ).c;
-    if (openExceptions > 0 && !options.force) {
       throw new AppError(
         ERROR_CODES.BATCH_STATE_INVALID,
-        `还有 ${openExceptions} 条关键保障异常未处理，发布前必须形成明确处理结果（可由管理员确认后强制执行）`,
+        '还没有成功发布的分配结果。请先试算、处理保障异常，再发布指定的试算结果',
         409,
-        { openExceptions },
       );
     }
+  }
+  if (target === 'closed') {
+    // 结束后停止常规写操作：未完成的候补一律标记结束
+    const now = nowIso();
+    db.prepare(
+      `UPDATE waitlist_entries SET status = 'closed', close_code = 'batch_closed', close_reason = ?, updated_at = ?
+       WHERE batch_id = ? AND status IN ('queued', 'suspended')`,
+    ).run('批次已结束，候补不再递补', now, batchId);
   }
 
   const now = nowIso();

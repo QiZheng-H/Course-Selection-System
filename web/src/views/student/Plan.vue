@@ -298,6 +298,22 @@ function parsedSummary(): Array<{ label: string; value: string }> {
           </button>
         </div>
 
+        <div v-if="result.program" class="alert" style="margin-bottom: 10px">
+          <strong>规划依据：{{ result.program.name }}（{{ result.program.code }}）</strong>
+          <div class="small">
+            总学分 {{ formatCredits(result.program.totalCredits) }} · 版本 {{ result.program.version }}
+            <span v-if="result.stage"> · 当前教学阶段 {{ result.stage }}</span>
+            <span v-if="result.term"> · 规划学期 {{ result.term }}</span>
+          </div>
+          <div class="small muted">
+            官方文件：{{ result.program.sourceFile }}
+            <template v-if="result.program.sourcePages">（{{ result.program.sourcePages }}）</template>
+          </div>
+          <div v-if="result.program.sourceUrl" class="small">
+            <a :href="result.program.sourceUrl" target="_blank" rel="noopener">查看官方原文件</a>
+          </div>
+        </div>
+
         <div v-if="activePlan">
           <p class="muted">{{ activePlan.description }}（来源：{{ activePlan.source }}）</p>
           <div class="inline" style="margin-bottom: 10px">
@@ -316,6 +332,7 @@ function parsedSummary(): Array<{ label: string; value: string }> {
                 <span class="mono small">{{ item.courseCode }}</span>
                 <span class="badge">{{ formatCredits(item.credits) }} 学分</span>
                 <span class="badge badge--muted">{{ demandLabel(item.demandLevel) }}</span>
+                <span v-if="item.nature" class="badge">{{ item.nature }}</span>
                 <span class="badge">{{ item.classCode }}</span>
                 <span v-if="enrolledCourseIds.has(item.courseId)" class="badge badge--ok">已在你的有效选课中</span>
                 <span class="spacer"></span>
@@ -323,6 +340,10 @@ function parsedSummary(): Array<{ label: string; value: string }> {
               </div>
               <div class="small muted">
                 {{ item.sessions.join('；') }}
+              </div>
+              <div v-if="item.suggestedTerm" class="small muted">
+                官方培养计划：{{ item.moduleName ?? '培养方案课程' }} · 建议修读 {{ item.suggestedTerm }}
+                <span v-if="item.termAdvice">（{{ item.termAdvice }}）</span>
               </div>
               <ul class="reason-list">
                 <li v-for="(reason, index) in item.reasons" :key="index">{{ reason }}</li>

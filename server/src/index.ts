@@ -9,6 +9,7 @@ import { config } from './config.js';
 import { createApp } from './routes/index.js';
 import { getDatabase, migrate } from './db/index.js';
 import { registerWaitlistModule } from './modules/waitlist/service.js';
+import { failInterruptedTasks } from './modules/tasks/service.js';
 import { purgeExpiredSessions } from './modules/auth/service.js';
 
 export function createServer(): { app: ReturnType<typeof createApp>; server: http.Server } {
@@ -16,6 +17,12 @@ export function createServer(): { app: ReturnType<typeof createApp>; server: htt
   const version = migrate(db);
   registerWaitlistModule();
   purgeExpiredSessions(db);
+  // 程序重启：上次未完成的后台任务与分配计算标记为失败，不会重复落位
+  const interrupted = failInterruptedTasks(db);
+  if (interrupted > 0) {
+    // eslint-disable-next-line no-console
+    console.log(`[tasks] 已收尾 ${interrupted} 个中断的分配/后台任务（未落位，可重新发起）`);
+  }
 
   const app = createApp();
 

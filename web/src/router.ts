@@ -24,6 +24,7 @@ const routes: RouteRecordRaw[] = [
       { path: 'results', name: 'student-results', component: () => import('@/views/student/Results.vue') },
       { path: 'records', name: 'student-records', component: () => import('@/views/student/Records.vue') },
       { path: 'plan', name: 'student-plan', component: () => import('@/views/student/Plan.vue') },
+      { path: 'program', name: 'student-program', component: () => import('@/views/student/Program.vue') },
     ],
   },
 
@@ -35,6 +36,7 @@ const routes: RouteRecordRaw[] = [
       { path: 'home', name: 'admin-home', component: () => import('@/views/admin/AdminHome.vue') },
       { path: 'batches', name: 'admin-batches', component: () => import('@/views/admin/Batches.vue') },
       { path: 'materials', name: 'admin-materials', component: () => import('@/views/admin/Materials.vue') },
+      { path: 'programs', name: 'admin-programs', component: () => import('@/views/admin/Programs.vue') },
       { path: 'allocation', name: 'admin-allocation', component: () => import('@/views/admin/Allocation.vue') },
       { path: 'guarantee', name: 'admin-guarantee', component: () => import('@/views/admin/Guarantee.vue') },
       { path: 'exceptions', name: 'admin-exceptions', component: () => import('@/views/admin/Exceptions.vue') },

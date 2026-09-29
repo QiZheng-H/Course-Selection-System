@@ -34,10 +34,15 @@ async function main(): Promise<void> {
   } else if (command === 'seed' || command === 'reset') {
     const summary = seedDatabase(db);
     log('演示数据写入完成：');
+    log(`  培养方案：${summary.programName}（${summary.programCode}），官方课程 ${summary.officialCourses} 门`);
     log(`  学生 ${summary.students} 人，课程 ${summary.courses} 门，教学班 ${summary.classes} 个`);
     log(`  修读记录 ${summary.records} 条，专业课预分配 ${summary.preallocations} 条`);
+    log(`  演示学期：${summary.term}（学生当前教学阶段三/1）`);
     log(`  演示选课批次 #${summary.batchId}（状态：正式受理，可直接提交志愿）`);
     log('  管理员：admin / admin123；学生：20241001-20241100 / 123456');
+    log('  说明：课程来自上海理工大学 2024 级计算机科学与技术专业官方培养计划；');
+    log('        教师、教学班时间与容量、学生账号与修读记录均为演示模拟配置（库内有 is_demo 标记）。');
+    log('        来源网址与页码见 docs/培养方案来源核对.md。');
   } else if (command === 'status') {
     const version = currentVersion(db);
     const counts = db

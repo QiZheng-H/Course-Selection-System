@@ -13,7 +13,7 @@ import { asyncHandler, createRequestContext, requireAdmin, requireAuth, resolveS
 import { errorHandler, notFoundHandler } from '../middleware/error.js';
 import { getDatabase, type SqliteDb } from '../db/index.js';
 import { config } from '../config.js';
-import type { AppRequest } from '../core/context.js';
+import type { AppRequest, AuthUser } from '../core/context.js';
 
 import * as authService from '../modules/auth/service.js';
 import * as usersService from '../modules/users/service.js';
@@ -28,12 +28,25 @@ import * as waitlistService from '../modules/waitlist/service.js';
 import * as materialsService from '../modules/materials/service.js';
 import * as preallocationService from '../modules/preallocation/service.js';
 import * as agentService from '../modules/agent/service.js';
+import * as tasksService from '../modules/tasks/service.js';
 import { listAudit } from '../core/audit.js';
 
-const { EnrollmentService, registerWaitlistPromotion } = enrollmentServiceModule;
+const { EnrollmentService, registerWaitlistPromotion, registerStudentChangeRecheck } = enrollmentServiceModule;
 
 /** 候补模块在名额释放后的提升逻辑注册进正式选课服务 */
 registerWaitlistPromotion((db, classId) => waitlistService.promoteWaitlistForClass(db, classId));
+/** 选退课/授权/资料确认后重新评估候补 */
+registerStudentChangeRecheck((db, studentId, batchId) => waitlistService.onStudentScheduleChanged(db, studentId, batchId));
+
+/** 授权或资料变化后重新评估候补（不影响主流程） */
+function safeRecheckWaitlist(db: SqliteDb, studentId: number, batchId: number | null | undefined, actor?: AuthUser): void {
+  if (!batchId) return;
+  try {
+    waitlistService.onStudentScheduleChanged(db, studentId, batchId, actor);
+  } catch {
+    // 记录已成功，候补重排失败不应让请求失败
+  }
+}
 
 /**
  * 组装应用。
@@ -133,8 +146,10 @@ function mountStudent(app: Express): void {
     const student = db
       .prepare(
         `SELECT s.user_id AS userId, s.student_no AS studentNo, s.name, s.grade, s.major, s.program_id AS programId,
-                s.admitted_year AS admittedYear, s.expected_graduate_at AS expectedGraduateAt,
-                u.username, u.last_login_at AS lastLoginAt, p.name AS programName, p.code AS programCode, p.total_credits AS totalCredits
+                s.admitted_year AS admittedYear, s.expected_graduate_at AS expectedGraduateAt, s.is_demo AS isDemo,
+                u.username, u.last_login_at AS lastLoginAt, p.name AS programName, p.code AS programCode,
+                p.total_credits AS totalCredits, p.version AS programVersion, p.source_file AS programSourceFile,
+                p.source_url AS programSourceUrl, p.source_pages AS programSourcePages, p.source_note AS programSourceNote
          FROM students s JOIN users u ON u.id = s.user_id
          LEFT JOIN programs p ON p.id = s.program_id
          WHERE s.user_id = ?`,
@@ -151,7 +166,7 @@ function mountStudent(app: Express): void {
     const rows = db
       .prepare(
         `SELECT r.id, r.course_id AS courseId, c.code AS courseCode, c.name AS courseName, c.credits,
-                r.status, r.term, r.source, r.verified, r.updated_at AS updatedAt
+                r.status, r.term, r.source, r.verified, r.updated_at AS updatedAt, r.is_demo AS isDemo
          FROM student_course_records r JOIN courses c ON c.id = r.course_id
          WHERE r.student_id = ? ${status ? 'AND r.status = ?' : ''}
          ORDER BY r.term DESC, c.code`,
@@ -165,13 +180,22 @@ function mountStudent(app: Express): void {
          WHERE e.student_id = ? AND e.status = 'enrolled' ORDER BY c.code`,
       )
       .all(scope);
-    return { records: rows, enrolled, confirmation: materialsService.getConfirmationStatus(db, scope) };
+    return {
+      records: rows,
+      enrolled,
+      confirmation: materialsService.getConfirmationStatus(db, scope),
+      demoNotice: curriculumService.readDemoNotice(db),
+    };
   });
 
   handle(router, 'post', '/records/confirm', requireAuth, async (req) => {
     const db = req.ctx.db;
     const scope = resolveStudentScope(req);
-    return materialsService.confirmMaterials(db, scope, req.ctx.user!);
+    const result = materialsService.confirmMaterials(db, scope, req.ctx.user!);
+    // 修读记录确认后，候补资格与顺位需要重新评估
+    const batch = batchService.getCurrentBatch(db);
+    if (batch) safeRecheckWaitlist(db, scope, batch.id, req.ctx.user!);
+    return result;
   });
 
   handle(router, 'get', '/progress', requireAuth, async (req) => {
@@ -194,7 +218,15 @@ function mountStudent(app: Express): void {
       progress: rulesService.computeProgress(db, scope),
       creditLimit: allocationService.readCreditLimit(db),
       model: agentService.getModelConfig(db),
+      plan: curriculumService.studentProgramPlan(db, scope),
     };
+  });
+
+  // 官方培养方案（含原文件、来源网址与页码），学生与 Agent 规划均以此为依据
+  handle(router, 'get', '/program-plan', requireAuth, async (req) => {
+    const db = req.ctx.db;
+    const scope = resolveStudentScope(req);
+    return curriculumService.studentProgramPlan(db, scope);
   });
 
   handle(router, 'get', '/timeline', requireAuth, async (req) => {
@@ -526,6 +558,88 @@ function mountEnrollment(app: Express): void {
     return { authorizations: rows };
   });
 
+  // 学生本人建立“课程替换授权”。管理员确认毕业资格不能代替学生同意退换课程，
+  // 因此该授权只允许学生自己创建。
+  handle(router, 'post', '/authorizations', requireAuth, async (req) => {
+    const db = req.ctx.db;
+    const user = req.ctx.user!;
+    if (user.role !== 'student') throw forbidden('替换授权必须由学生本人确认');
+    const studentId = resolveStudentScope(req);
+    if (studentId !== user.id) throw forbidden('只能为自己创建授权');
+    const batchId = idParam(req.body?.batchId, 'batchId');
+    const result = curriculumService.grantUpgradeAuthorization(
+      db,
+      {
+        studentId,
+        batchId,
+        sourceClassId: idParam(req.body?.sourceClassId, 'sourceClassId'),
+        targetCourseId: idParam(req.body?.targetCourseId, 'targetCourseId'),
+        targetClassId: num(req.body?.targetClassId),
+        expiresAt: req.body?.expiresAt ?? null,
+      },
+      user,
+    );
+    safeRecheckWaitlist(db, studentId, batchId, user);
+    return result;
+  });
+
+  handle(router, 'delete', '/authorizations/:id', requireAuth, async (req) => {
+    const db = req.ctx.db;
+    const id = idParam(req.params.id, 'id');
+    const row = db.prepare('SELECT student_id, batch_id FROM upgrade_authorizations WHERE id = ?').get(id) as
+      | { student_id: number; batch_id: number }
+      | undefined;
+    curriculumService.revokeUpgradeAuthorization(db, id, req.ctx.user!);
+    if (row) safeRecheckWaitlist(db, row.student_id, row.batch_id, req.ctx.user!);
+    return { ok: true };
+  });
+
+  // 学生毕业兜底授权：明确接受哪些教学班
+  handle(router, 'get', '/guarantee-authorizations', requireAuth, async (req) => {
+    const db = req.ctx.db;
+    const studentId = resolveStudentScope(req);
+    return {
+      authorizations: curriculumService.listGuaranteeAuthorizations(db, {
+        studentId,
+        batchId: num(req.query.batchId) ?? undefined,
+      }),
+    };
+  });
+
+  handle(router, 'post', '/guarantee-authorizations', requireAuth, async (req) => {
+    const db = req.ctx.db;
+    const user = req.ctx.user!;
+    if (user.role !== 'student') throw forbidden('毕业兜底授权必须由学生本人确认');
+    const studentId = resolveStudentScope(req);
+    if (studentId !== user.id) throw forbidden('只能为自己创建授权');
+    const batchId = idParam(req.body?.batchId, 'batchId');
+    const result = curriculumService.grantGuaranteeAuthorization(
+      db,
+      {
+        studentId,
+        batchId,
+        courseId: idParam(req.body?.courseId, 'courseId'),
+        classIds: intList(req.body?.classIds),
+        expiresAt: req.body?.expiresAt ?? null,
+        note: str(req.body?.note) || null,
+      },
+      user,
+    );
+    safeRecheckWaitlist(db, studentId, batchId, user);
+    return result;
+  });
+
+  handle(router, 'delete', '/guarantee-authorizations/:id', requireAuth, async (req) => {
+    const db = req.ctx.db;
+    const id = idParam(req.params.id, 'id');
+    const row = db.prepare('SELECT student_id, batch_id FROM guarantee_authorizations WHERE id = ?').get(id) as
+      | { student_id: number; batch_id: number }
+      | undefined;
+    curriculumService.revokeGuaranteeAuthorization(db, id, req.ctx.user!);
+    if (row) safeRecheckWaitlist(db, row.student_id, row.batch_id, req.ctx.user!);
+    return { ok: true };
+  });
+
   app.use('/api', router);
 }
 
@@ -821,7 +935,7 @@ function mountAdmin(app: Express): void {
   // ---- 培养方案与必需课程 ----
   handle(router, 'get', '/programs', async (req) => {
     const db = req.ctx.db;
-    return { programs: curriculumService.listPrograms(db) };
+    return { programs: curriculumService.listPrograms(db), demoNotice: curriculumService.readDemoNotice(db) };
   });
 
   handle(router, 'get', '/programs/:programId', async (req) => {
@@ -930,11 +1044,44 @@ function mountAdmin(app: Express): void {
     const db = req.ctx.db;
     const batchId = idParam(req.params.batchId, 'batchId');
     const mode = (str(req.body?.mode) || 'simulate') as 'simulate' | 'publish';
-    return allocationService.runAllocation(db, batchId, req.ctx.user!, {
+    // 耗时计算放进后台任务：接口立即返回任务标识，页面轮询任务状态
+    return tasksService.startAllocationTask(db, batchId, req.ctx.user!, {
       mode,
       timeoutMs: num(req.body?.timeoutMs) === null ? config.taskTimeoutMs : Number(req.body?.timeoutMs),
       idempotencyKey: str(req.body?.idempotencyKey) || undefined,
+      sourceRunId: num(req.body?.sourceRunId) ?? undefined,
+      taskIdempotencyKey: str(req.body?.idempotencyKey) || undefined,
     });
+  });
+
+  // 发布指定的、检查通过的试算结果（整体事务，失败回滚）
+  handle(router, 'post', '/runs/:runId/publish', async (req) => {
+    const db = req.ctx.db;
+    const result = allocationService.publishRun(db, idParam(req.params.runId, 'runId'), req.ctx.user!);
+    return {
+      runId: result.runId,
+      status: 'published',
+      report: result.report,
+      idempotentReplay: result.idempotentReplay,
+      alreadyPublished: result.alreadyPublished,
+    };
+  });
+
+  handle(router, 'get', '/tasks/:taskId', async (req) => {
+    const db = req.ctx.db;
+    return { task: tasksService.getTask(db, idParam(req.params.taskId, 'taskId')) };
+  });
+
+  handle(router, 'get', '/tasks', async (req) => {
+    const db = req.ctx.db;
+    const { page, pageSize, offset } = pagination(req.query as Record<string, unknown>, 50);
+    const result = tasksService.listTasks(db, {
+      batchId: num(req.query.batchId) ?? undefined,
+      kind: str(req.query.kind) || undefined,
+      limit: pageSize,
+      offset,
+    });
+    return { ...result, page, pageSize };
   });
 
   handle(router, 'get', '/batches/:batchId/runs', async (req) => {
@@ -954,9 +1101,9 @@ function mountAdmin(app: Express): void {
     const run = runId
       ? ({ id: runId } as { id: number })
       : (db
-          .prepare("SELECT id FROM allocation_runs WHERE batch_id = ? AND mode = 'publish' ORDER BY attempt DESC LIMIT 1")
+          .prepare("SELECT id FROM allocation_runs WHERE batch_id = ? AND status = 'published' ORDER BY id DESC LIMIT 1")
           .get(batchId) as { id: number } | undefined);
-    if (!run) throw notFound('找不到可用的发布记录，请先执行发布模式的分配');
+    if (!run) throw notFound('找不到已发布的分配结果，请先试算并发布');
     const queued = waitlistService.enqueueRejectedFromAllocation(db, batchId, run.id, req.ctx.user!);
     return { queued, runId: run.id };
   });
@@ -1020,20 +1167,28 @@ function mountAdmin(app: Express): void {
     );
   });
 
-  handle(router, 'post', '/guarantee/authorizations', async (req) => {
+  // 管理员只能查看授权情况，不能代替学生创建替换授权（必须由学生本人同意）
+  handle(router, 'get', '/guarantee/authorizations', async (req) => {
     const db = req.ctx.db;
-    return curriculumService.grantUpgradeAuthorization(
-      db,
-      {
-        studentId: idParam(req.body?.studentId, 'studentId'),
-        batchId: idParam(req.body?.batchId, 'batchId'),
-        sourceClassId: idParam(req.body?.sourceClassId, 'sourceClassId'),
-        targetCourseId: idParam(req.body?.targetCourseId, 'targetCourseId'),
-        targetClassId: num(req.body?.targetClassId),
-        expiresAt: req.body?.expiresAt ?? null,
-      },
-      req.ctx.user!,
-    );
+    const batchId = num(req.query.batchId);
+    const conditions = batchId ? 'WHERE ua.batch_id = ?' : '';
+    const rows = db
+      .prepare(
+        `SELECT ua.id, ua.student_id AS studentId, s.student_no AS studentNo, s.name AS studentName,
+                ua.status, ua.granted_at AS grantedAt, ua.expires_at AS expiresAt, ua.used_at AS usedAt,
+                sc.name AS sourceCourseName, tc.name AS targetCourseName
+         FROM upgrade_authorizations ua
+         JOIN students s ON s.user_id = ua.student_id
+         JOIN courses sc ON sc.id = ua.source_course_id
+         JOIN courses tc ON tc.id = ua.target_course_id
+         ${conditions} ORDER BY ua.id DESC`,
+      )
+      .all(...(batchId ? [batchId] : []));
+    return {
+      authorizations: rows,
+      guaranteeAuthorizations: curriculumService.listGuaranteeAuthorizations(db, { batchId: batchId ?? undefined }),
+      notice: '替换授权与毕业兜底授权都必须由学生本人确认，管理员确认毕业资格不能代替学生同意退换课程。',
+    };
   });
 
   // ---- 资料导入 ----

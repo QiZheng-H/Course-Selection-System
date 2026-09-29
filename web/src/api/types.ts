@@ -77,6 +77,8 @@ export interface TeacherDto {
   name: string;
   department: string | null;
   title: string | null;
+  /** 教师信息为演示模拟配置 */
+  isDemo?: boolean;
 }
 
 export interface ClassDto {
@@ -93,6 +95,8 @@ export interface ClassDto {
   status: 'open' | 'closed' | 'cancelled';
   campus: string | null;
   note: string | null;
+  /** 教学班时间 / 容量 / 教师是否为演示模拟配置 */
+  isDemo?: boolean;
   sessions: SessionDto[];
   capacity: number;
   reservedSeats: number;
@@ -200,6 +204,10 @@ export interface OperationRow {
 
 export interface AuthorizationRow {
   id: number;
+  /** 管理端只读列表会带上学生信息 */
+  studentId?: number;
+  studentNo?: string;
+  studentName?: string;
   status: string;
   grantedAt: string;
   expiresAt: string | null;
@@ -392,6 +400,9 @@ export interface WaitlistEntry {
   suspendCode: string | null;
   suspendReason: string | null;
   suspendHint?: string;
+  /** 顺位变化原因（例如“更高偏好已落实”“等待授权”） */
+  positionReason: string | null;
+  source: string | null;
   closeCode: string | null;
   closeReason: string | null;
   createdAt: string;
@@ -453,6 +464,14 @@ export interface PlanItem {
   sessions: string[];
   reasons: string[];
   weeklyText: string[];
+  /** 官方培养方案：建议修读学年学期 */
+  suggestedTerm: string | null;
+  /** 官方培养方案：必修 / 选修 */
+  nature: string | null;
+  /** 官方培养方案：所属模块 */
+  moduleName: string | null;
+  /** 相对当前阶段的修读建议（本学期 / 补修 / 提前修读） */
+  termAdvice: string | null;
 }
 
 export interface Plan {
@@ -466,6 +485,19 @@ export interface Plan {
   source: string;
 }
 
+export interface ProgramSource {
+  code: string;
+  name: string;
+  grade: string | null;
+  major: string | null;
+  totalCredits: number;
+  version: string;
+  sourceFile: string | null;
+  sourceUrl: string | null;
+  sourcePages: string | null;
+  sourceNote: string | null;
+}
+
 export interface PlanningResult {
   generatedAt: string;
   mode: 'offline' | 'offline-fallback' | 'online';
@@ -475,6 +507,45 @@ export interface PlanningResult {
   requirements: RequirementProgress[];
   conflicts: ScheduleConflict[];
   pendingConfirmations: string[];
+  /** 规划依据的官方培养方案（含来源网址与页码） */
+  program: ProgramSource | null;
+  /** 当前教学阶段，例如 三/1 */
+  stage: string | null;
+  term: string;
+}
+
+/* ------------------------ 官方培养方案（学生视角） ------------------------ */
+
+export interface ProgramPlanCourse {
+  requirementId: number;
+  courseId: number;
+  code: string;
+  name: string;
+  credits: number;
+  nature: string | null;
+  suggestedTerm: string | null;
+  relation: string;
+  priority: number;
+}
+
+export interface ProgramPlanModule {
+  id: number;
+  code: string;
+  name: string;
+  category: string | null;
+  nature: string | null;
+  requiredCredits: number;
+  minCourses: number;
+  priority: number;
+  note: string | null;
+  sourcePages: string | null;
+  courses: ProgramPlanCourse[];
+}
+
+export interface StudentProgramPlan {
+  program: (ProgramSource & { id: number; status: string; publishedAt: string | null; sourceSha256: string | null }) | null;
+  modules: ProgramPlanModule[];
+  demoNotice: string | null;
 }
 
 export interface ParsedPreference {
@@ -626,6 +697,7 @@ export interface AllocationRun {
   snapshotHash: string | null;
   startedAt: string | null;
   finishedAt: string | null;
+  publishedAt?: string | null;
   durationMs: number | null;
   failureCode: string | null;
   failureReason: string | null;
@@ -759,4 +831,51 @@ export interface GridEntry {
   source?: string | null;
   credits?: number | null;
   sessions: GridSession[];
+}
+
+/* ---------------------- 后台任务与毕业兜底授权 ---------------------- */
+
+export interface BackgroundTask {
+  id: number;
+  kind: 'allocation' | 'planning';
+  batchId: number | null;
+  runId: number | null;
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'timeout' | 'cancelled';
+  progress: number;
+  total: number;
+  result: {
+    runId?: number;
+    status?: string;
+    report?: {
+      allocated?: number;
+      rejected?: number;
+      guaranteeFulfilled?: number;
+      releasedReservedSeats?: number;
+      exceptions?: unknown[];
+    } | null;
+    failure?: { code: string; reason: string };
+    idempotentReplay?: boolean;
+  } | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  idempotencyKey: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  percent: number;
+  retryable: boolean;
+}
+
+export interface GuaranteeAuthorizationRow {
+  id: number;
+  studentId: number;
+  batchId: number;
+  courseId: number;
+  courseName: string;
+  classIds: string;
+  status: string;
+  note: string | null;
+  grantedAt: string;
+  expiresAt: string | null;
+  revokedAt: string | null;
 }

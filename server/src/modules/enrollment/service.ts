@@ -300,6 +300,8 @@ export class EnrollmentService {
 
     try {
       const result = this.db.transaction((): OperationResult => {
+        // 退课同样受批次阶段约束：冻结期与结束后都不能改选
+        this.assertBatchWritable(options);
         const row = activeEnrollmentForClass(this.db, studentId, classId);
         if (!row) throw new AppError(ERROR_CODES.NO_ENROLLMENT, '没有找到该教学班的有效选课记录', 404);
         this.db
@@ -311,6 +313,22 @@ export class EnrollmentService {
             row.course_id,
             'queued',
           );
+        }
+        // 受保护学生主动退课后，毕业保障视为“主动放弃”，再次保护需要管理员重新确认。
+        // 同课换班成功、校方取消课程不经过这里，因此不会被误判为主动放弃。
+        if (!options.allowFrozen) {
+          this.db
+            .prepare(
+              `UPDATE graduation_reservations SET status = 'revoked', released_at = ?
+               WHERE student_id = ? AND course_id = ? AND status IN ('active', 'fulfilled')`,
+            )
+            .run(now, studentId, row.course_id);
+          this.db
+            .prepare(
+              `UPDATE guarantee_authorizations SET status = 'revoked', revoked_at = ?
+               WHERE student_id = ? AND course_id = ? AND status = 'active'`,
+            )
+            .run(now, studentId, row.course_id);
         }
         const opId = options.skipOperationLog
           ? 0
@@ -336,6 +354,7 @@ export class EnrollmentService {
         return { ok: true, opType, idempotentReplay: false, releasedClass: released, enrollmentId: row.id };
       })();
       this.promoteForClass(classId);
+      notifyStudentChange(this.db, studentId, options.batchId);
       return result;
     } catch (error) {
       return this.failOperation(studentId, opType, key, error, options, { sourceClassId: classId });
@@ -426,6 +445,9 @@ export class EnrollmentService {
             409,
           );
         }
+
+        // 替代组一致性（首轮、候补、手动补选、替换共用同一约束）
+        this.assertSubstituteGroup(studentId, options.batchId, targetClass.courseId);
 
         // 检查替换后的完整课表
         const evaluation = evaluateSchedule(this.db, studentId, plan.addClassIds, {
@@ -535,6 +557,8 @@ export class EnrollmentService {
         for (const classId of plan.removeClassIds) {
           this.promoteForClass(classId);
         }
+        // 释放了原课：学生自己的候补申请需要按最新课表重新评估
+        notifyStudentChange(this.db, studentId, options.batchId);
       }
       return result;
     } catch (error) {
@@ -579,18 +603,68 @@ export class EnrollmentService {
     );
   }
 
-  /** 校验批次状态是否允许当前写入 */
+  /** 校验批次阶段是否允许当前写入 */
   private assertBatchWritable(options: OperationOptions): void {
-    if (!options.batchId || options.allowFrozen) return;
-    const batch = this.db
-      .prepare('SELECT id, status FROM selection_batches WHERE id = ?')
-      .get(options.batchId) as { id: number; status: string } | undefined;
-    if (!batch) return;
-    if (batch.status === 'frozen') {
-      throw new AppError(ERROR_CODES.BATCH_FROZEN, '本轮已截止冻结，暂时不能改选', 409);
+    // 内部系统操作（预分配、统一分配发布、候补提升）显式声明 allowFrozen，不受阶段限制
+    if (options.allowFrozen) return;
+    const row = options.batchId
+      ? (this.db.prepare('SELECT id, status FROM selection_batches WHERE id = ?').get(options.batchId) as
+          | { id: number; status: string }
+          | undefined)
+      : (this.db
+          .prepare("SELECT id, status FROM selection_batches WHERE status NOT IN ('closed') ORDER BY id DESC LIMIT 1")
+          .get() as { id: number; status: string } | undefined);
+    // 首轮之前（preparing / preview / open / frozen）与结束后都不允许直接占用或释放名额
+    if (!row) {
+      throw new AppError(ERROR_CODES.BATCH_STATE_INVALID, '当前没有开放正式选退课的批次，请等待结果发布', 409);
     }
-    if (batch.status === 'closed') {
-      throw new AppError(ERROR_CODES.BATCH_STATE_INVALID, '批次已结束', 409);
+    if (row.status === 'published' || row.status === 'waitlist') return;
+    if (row.status === 'frozen') {
+      throw new AppError(ERROR_CODES.BATCH_FROZEN, '本轮已截止冻结，分配期间不能改选', 409);
+    }
+    if (row.status === 'closed') {
+      throw new AppError(ERROR_CODES.BATCH_STATE_INVALID, '批次已结束，不能再改选', 409);
+    }
+    throw new AppError(
+      ERROR_CODES.BATCH_STATE_INVALID,
+      `批次当前状态为「${row.status}」：正式选退课在首轮结果发布后才开放`,
+      409,
+    );
+  }
+
+  /**
+   * 替代组一致性：同一替代组最多落实一门。
+   * 首轮、候补、手动补选与替换都走这里，保证约束在所有入口一致。
+   */
+  private assertSubstituteGroup(studentId: number, batchId: number | null | undefined, targetCourseId: number): void {
+    if (!batchId) return;
+    const rows = this.db
+      .prepare(
+        `SELECT pg.code, pgc.course_id
+         FROM preference_submissions ps
+         JOIN preference_groups pg ON pg.submission_id = ps.id
+         JOIN preference_group_courses pgc ON pgc.group_id = pg.id
+         WHERE ps.student_id = ? AND ps.batch_id = ? AND ps.status = 'submitted'`,
+      )
+      .all(studentId, batchId) as Array<{ code: string; course_id: number }>;
+    if (rows.length === 0) return;
+    const groupOfTarget = rows.find((r) => r.course_id === targetCourseId)?.code;
+    if (!groupOfTarget) return;
+    const groupCourseIds = rows.filter((r) => r.code === groupOfTarget).map((r) => r.course_id);
+    const enrolled = this.db
+      .prepare(
+        `SELECT DISTINCT course_id FROM enrollments
+         WHERE student_id = ? AND status = 'enrolled' AND course_id IN (${groupCourseIds.map(() => '?').join(',')})`,
+      )
+      .all(studentId, ...groupCourseIds) as Array<{ course_id: number }>;
+    const conflict = enrolled.find((e) => e.course_id !== targetCourseId);
+    if (conflict) {
+      throw new AppError(
+        ERROR_CODES.SUBSTITUTE_GROUP_VIOLATION,
+        `替代组「${groupOfTarget}」已落实一门课程，组内不再重复落实`,
+        409,
+        { groupCode: groupOfTarget, fulfilledCourseId: conflict.course_id },
+      );
     }
   }
 
@@ -678,6 +752,26 @@ let promoteImpl: PromoteFn | null = null;
 
 export function registerWaitlistPromotion(fn: PromoteFn): void {
   promoteImpl = fn;
+}
+
+/**
+ * 学生课表/授权变化后的重新评估回调（由候补模块注入）。
+ * 选退课、换班、替换、授权变化后都要按最新状态重排候补。
+ */
+type RecheckFn = (db: SqliteDb, studentId: number, batchId: number) => void;
+let recheckImpl: RecheckFn | null = null;
+
+export function registerStudentChangeRecheck(fn: RecheckFn): void {
+  recheckImpl = fn;
+}
+
+function notifyStudentChange(db: SqliteDb, studentId: number, batchId: number | null | undefined): void {
+  if (!recheckImpl || !batchId) return;
+  try {
+    recheckImpl(db, studentId, batchId);
+  } catch {
+    // 重新评估失败不能影响已经成功的选退课
+  }
 }
 
 export const ALLOWED_ENROLLMENT_OP_TYPES = ALLOWED_OP_TYPES;

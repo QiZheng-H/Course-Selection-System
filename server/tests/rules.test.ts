@@ -79,7 +79,7 @@ describe('时间冲突判断', () => {
 
 describe('选课事务：时间冲突、学分上限、重复课程、幂等与回滚', () => {
   it('时间冲突时拒绝选课，并且不会留下任何记录', async () => {
-    const batch = await setupBatch(ctx, { name: '冲突用例' });
+    const batch = await setupBatch(ctx, { name: '冲突用例', status: 'waitlist' });
     const now = new Date().toISOString();
     const courseInfo = ctx.db
       .prepare(
@@ -126,7 +126,7 @@ describe('选课事务：时间冲突、学分上限、重复课程、幂等与�
   });
 
   it('替换失败保留原课（整体回滚，不允许先退原课）', async () => {
-    const batch = await setupBatch(ctx, { name: '替换回滚' });
+    const batch = await setupBatch(ctx, { name: '替换回滚', status: 'waitlist' });
     const now = new Date().toISOString();
     const courseInfo = ctx.db
       .prepare(
@@ -197,7 +197,7 @@ describe('选课事务：时间冲突、学分上限、重复课程、幂等与�
   });
 
   it('换班成功：同一课程内换到另一个教学班，只保留一条有效记录', async () => {
-    const batch = await setupBatch(ctx, { name: '同课换班' });
+    const batch = await setupBatch(ctx, { name: '同课换班', status: 'waitlist' });
     const now = new Date().toISOString();
     const courseInfo = ctx.db
       .prepare(
@@ -239,7 +239,7 @@ describe('选课事务：时间冲突、学分上限、重复课程、幂等与�
   });
 
   it('幂等键让重复提交只执行一次，且换 key 会真的再执行', async () => {
-    const batch = await setupBatch(ctx, { name: '幂等' });
+    const batch = await setupBatch(ctx, { name: '幂等', status: 'waitlist' });
     const now = new Date().toISOString();
     const courseInfo = ctx.db
       .prepare(
@@ -290,7 +290,7 @@ describe('选课事务：时间冲突、学分上限、重复课程、幂等与�
   });
 
   it('退课会释放名额，并且候补模块不会占用预留名额', async () => {
-    const batch = await setupBatch(ctx, { name: '退课释放' });
+    const batch = await setupBatch(ctx, { name: '退课释放', status: 'waitlist' });
     const now = new Date().toISOString();
     const courseInfo = ctx.db
       .prepare(
@@ -518,7 +518,7 @@ describe('志愿校验与权限', () => {
       .get() as { user_id: number; student_no: string };
     const cookie = (await login(ctx.app, studentRow.student_no, '123456')).cookie;
     const adminSession = await login(ctx.app, 'admin', 'admin123');
-    const batch = await setupBatch(ctx, { name: '授权替换' });
+    const batch = await setupBatch(ctx, { name: '授权替换', status: 'waitlist' });
 
     // 学生先选上“原课程”
     const now = new Date().toISOString();
@@ -567,9 +567,16 @@ describe('志愿校验与权限', () => {
       .send({ authorizationId: 999999, idempotencyKey: 'up-noauth' });
     expect(noAuth.status).toBe(404);
 
-    const grant = await request(ctx.app)
-      .post('/api/admin/guarantee/authorizations')
+    // 替换授权必须由学生本人确认（管理员确认毕业资格不能代替学生同意退换课程）
+    const forbidden = await request(ctx.app)
+      .post('/api/authorizations')
       .set(authHeader(adminSession.cookie))
+      .send({ studentId: studentRow.user_id, batchId: batch.batchId, sourceClassId, targetCourseId, targetClassId });
+    expect(forbidden.status).toBe(403);
+
+    const grant = await request(ctx.app)
+      .post('/api/authorizations')
+      .set(authHeader(cookie))
       .send({
         studentId: studentRow.user_id,
         batchId: batch.batchId,

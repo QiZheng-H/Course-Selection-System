@@ -196,3 +196,77 @@ export async function submitPreferences(
   return { status: response.status, body: response.body };
 }
 
+// ---------------------------------------------------------------------------
+// 后台任务：分配计算现在通过可跟踪的任务执行，测试统一轮询任务状态
+// ---------------------------------------------------------------------------
+
+export interface TaskSnapshot {
+  id: number;
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'timeout' | 'cancelled';
+  runId: number | null;
+  progress: number;
+  total: number;
+  result: Record<string, unknown> | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  percent: number;
+  retryable: boolean;
+}
+
+export async function waitForTask(
+  ctx: TestContext,
+  adminCookie: string,
+  taskId: number,
+  timeoutMs = 20_000,
+): Promise<TaskSnapshot> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const response = await request(ctx.app).get(`/api/admin/tasks/${taskId}`).set(authHeader(adminCookie));
+    if (response.status !== 200) throw new Error(`查询任务失败：${JSON.stringify(response.body)}`);
+    const task = response.body.data.task as TaskSnapshot;
+    if (!['queued', 'running'].includes(task.status)) return task;
+    if (Date.now() > deadline) throw new Error(`任务 ${taskId} 在 ${timeoutMs}ms 内没有完成`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+export interface AllocationRunResult {
+  taskId: number;
+  runId: number;
+  status: string;
+  report: {
+    allocated: number;
+    rejected: number;
+    guaranteeFulfilled: number;
+    releasedReservedSeats: number;
+    exceptions: unknown[];
+  } | null;
+  task: TaskSnapshot;
+}
+
+/** 发起一次分配（后台任务）并等待其结束 */
+export async function runAllocationTask(
+  ctx: TestContext,
+  adminCookie: string,
+  batchId: number,
+  mode: 'simulate' | 'publish',
+  options: Record<string, unknown> = {},
+): Promise<AllocationRunResult> {
+  const post = await request(ctx.app)
+    .post(`/api/admin/batches/${batchId}/allocate`)
+    .set(authHeader(adminCookie))
+    .send({ mode, ...options });
+  if (post.status !== 200) throw new Error(`发起分配失败：${JSON.stringify(post.body)}`);
+  const taskId = post.body.data.taskId as number;
+  const task = await waitForTask(ctx, adminCookie, taskId);
+  const result = (task.result ?? {}) as { runId?: number; status?: string; report?: AllocationRunResult['report'] };
+  const runId = result.runId ?? task.runId ?? 0;
+  return {
+    taskId,
+    runId,
+    status: result.status ?? task.status,
+    report: result.report ?? null,
+    task,
+  };
+}
+

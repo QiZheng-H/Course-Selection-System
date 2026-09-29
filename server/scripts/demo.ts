@@ -52,6 +52,26 @@ function line(text: string): void {
   process.stdout.write(`  ${text}\n`);
 }
 
+/** 后台任务：分配计算通过任务执行，接口立即返回任务标识，这里轮询到终态 */
+async function waitForTask(
+  taskId: number,
+  what: string,
+  timeoutMs = 120_000,
+): Promise<{ id: number; status: string; runId: number | null; result: Record<string, unknown> | null; errorCode: string | null; errorMessage: string | null; percent: number }> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const res = await api<{ task: { id: number; status: string; runId: number | null; result: Record<string, unknown> | null; errorCode: string | null; errorMessage: string | null; percent: number } }>(
+      'GET',
+      `/api/admin/tasks/${taskId}`,
+    );
+    const task = must(res, `读取${what}任务状态`).task;
+    if (task.status !== 'queued' && task.status !== 'running') return task;
+    if (Date.now() > deadline) throw new Error(`${what} 任务 ${timeoutMs}ms 内未结束`);
+    line(`  … ${what}任务 #${task.id} ${task.status}（${task.percent}%）`);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+}
+
 function must<T>(result: ApiResult<T>, what: string): T {
   if (!result.ok) {
     throw new Error(`${what} 失败（HTTP ${result.status}）：${result.error?.code} ${result.error?.message}`);
@@ -260,32 +280,47 @@ async function main(): Promise<void> {
   await api('POST', '/api/auth/login', { username: 'admin', password: 'admin123' });
   const freeze = must(await api<{ contentHash: string }>('POST', `/api/admin/batches/${batch.id}/freeze`, {}), '冻结批次');
   line(`快照已生成，内容哈希：${freeze.contentHash.slice(0, 16)}…`);
-  const simulate = must(await api<{ runId: number; report: { allocated: number; rejected: number; guaranteeFulfilled: number; exceptions: unknown[]; durationMs: number } }>(
+  const simulateStart = must(await api<{ taskId: number }>(
     'POST',
     `/api/admin/batches/${batch.id}/allocate`,
     { mode: 'simulate' },
-  ), '试算分配');
-  line(`试算 runId=${simulate.runId}：落实 ${simulate.report.allocated} 项，未落实 ${simulate.report.rejected} 项，用时 ${simulate.report.durationMs}ms`);
-  line(`保障异常 ${simulate.report.exceptions.length} 条`);
+  ), '发起试算任务');
+  const simulateTask = await waitForTask(simulateStart.taskId, '试算');
+  const simulateReport = (simulateTask.result?.report ?? null) as { allocated: number; rejected: number; guaranteeFulfilled: number; exceptions: unknown[]; durationMs: number } | null;
+  if (simulateTask.status !== 'succeeded' || !simulateReport) {
+    throw new Error(`试算失败：${simulateTask.errorCode} ${simulateTask.errorMessage}`);
+  }
+  line(`试算 runId=${simulateTask.result?.runId}：落实 ${simulateReport.allocated} 项，未落实 ${simulateReport.rejected} 项，用时 ${simulateReport.durationMs}ms`);
+  line(`保障异常 ${simulateReport.exceptions.length} 条（试算不修改任何正式数据）`);
 
-  step('⑨ 管理员确认发布结果（可安全重试）');
-  const publish = must(await api<{ runId: number; status: string; report: { allocated: number } }>(
+  step('⑨ 管理员发布指定的、检查通过的试算结果（整体事务，可安全重试）');
+  // 先处理本次试算产生的关键保障异常（如果有），否则发布会按基线拒绝
+  const openExceptions = must(await api<{ items: Array<{ id: number; kind: string; severity: string }> }>(
+    'GET',
+    `/api/admin/exceptions?batchId=${batch.id}&status=open`,
+  ), '读取异常清单');
+  const critical = openExceptions.items.filter((item) => item.severity === 'critical');
+  for (const item of critical) {
+    await api('POST', `/api/admin/exceptions/${item.id}/resolve`, { resolution: '演示脚本：已确认处理结果', status: 'resolved' });
+  }
+  if (critical.length > 0) line(`已为 ${critical.length} 条关键保障异常写入明确处理结果`);
+
+  const publish = must(await api<{ runId: number; status: string; report: { allocated: number } | null; idempotentReplay: boolean }>(
     'POST',
-    `/api/admin/batches/${batch.id}/allocate`,
-    { mode: 'publish', idempotencyKey: `demo-publish-${batch.id}`, timeoutMs: 60000 },
-  ), '发布结果');
-  line(`发布完成：run #${publish.runId}，落实 ${publish.report.allocated} 项`);
-  const retry = must(await api<{ idempotentReplay: boolean }>(
+    `/api/admin/runs/${simulateTask.result?.runId}/publish`,
+    {},
+  ), '发布试算结果');
+  line(`发布完成：run #${publish.runId}，落实 ${publish.report?.allocated ?? 0} 项`);
+  const republish = must(await api<{ idempotentReplay: boolean }>(
     'POST',
-    `/api/admin/batches/${batch.id}/allocate`,
-    { mode: 'publish', idempotencyKey: `demo-publish-${batch.id}` },
+    `/api/admin/runs/${simulateTask.result?.runId}/publish`,
+    {},
   ), '重复发布');
-  line(`重复发布是否复用结果：${retry.idempotentReplay ? '是（名额没有被重复扣减）' : '否'}`);
+  line(`重复发布是否复用结果：${republish.idempotentReplay ? '是（不会取消学生已有课程，也不会重复占位）' : '否'}`);
 
   step('⑩ 进入候补与退改选，落选申请自动候补');
-  must(await api('POST', `/api/admin/batches/${batch.id}/transition`, { status: 'published' }), '切换到已发布');
-  const enqueue = must(await api<{ queued: number }>('POST', `/api/admin/batches/${batch.id}/enqueue-waitlist`, {}), '转入候补');
-  line(`转入候补 ${enqueue.queued} 条`);
+  const autoQueued = must(await api<{ queued: number }>('POST', `/api/admin/batches/${batch.id}/enqueue-waitlist`, {}), '转入候补');
+  line(`发布时自动生成的候补：${autoQueued.queued} 条`);
   must(await api('POST', `/api/admin/batches/${batch.id}/transition`, { status: 'waitlist' }), '切换到候补阶段');
   line('批次状态：候补与退改选');
 

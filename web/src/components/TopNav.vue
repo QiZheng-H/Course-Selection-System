@@ -17,12 +17,14 @@ const studentLinks = [
   { name: 'student-results', label: '结果与候补' },
   { name: 'student-records', label: '修读记录' },
   { name: 'student-plan', label: '偏好与规划' },
+  { name: 'student-program', label: '培养方案' },
 ];
 
 const adminLinks = [
   { name: 'admin-home', label: '总览' },
   { name: 'admin-batches', label: '批次控制' },
   { name: 'admin-materials', label: '资料核对' },
+  { name: 'admin-programs', label: '培养方案' },
   { name: 'admin-allocation', label: '预分配与分配' },
   { name: 'admin-guarantee', label: '毕业保障' },
   { name: 'admin-exceptions', label: '异常与记录' },

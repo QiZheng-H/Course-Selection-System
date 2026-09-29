@@ -318,6 +318,36 @@ export function validateDraft(db: SqliteDb, studentId: number, _batchId: number,
   };
 }
 
+/**
+ * 提交 / 撤回的时间与状态校验。
+ * 关键点：截止判断使用服务器时间与管理员配置的开放/截止时刻，
+ * 不能依赖“管理员恰好在截止时点了冻结”。
+ */
+function assertSubmissionWindow(batch: {
+  status: string;
+  open_at: string | null;
+  close_at: string | null;
+}): void {
+  if (batch.status === 'preparing') {
+    throw new AppError(ERROR_CODES.SUBMISSION_CLOSED, '资料准备阶段尚未开放志愿提交', 409);
+  }
+  if (
+    batch.status === 'frozen' ||
+    batch.status === 'published' ||
+    batch.status === 'waitlist' ||
+    batch.status === 'closed'
+  ) {
+    throw new AppError(ERROR_CODES.SUBMISSION_CLOSED, '本轮志愿已截止冻结，不能再提交或撤回', 409);
+  }
+  const now = Date.now();
+  if (batch.open_at && now < new Date(batch.open_at).getTime()) {
+    throw new AppError(ERROR_CODES.SUBMISSION_CLOSED, '本轮志愿尚未开放提交', 409);
+  }
+  if (batch.close_at && now >= new Date(batch.close_at).getTime()) {
+    throw new AppError(ERROR_CODES.SUBMISSION_CLOSED, '已到管理员设定的截止时间，不能再提交或撤回', 409);
+  }
+}
+
 /** 提交志愿：生成不可变版本，保证重复提交留下可审计的历史 */
 export function submitPreferences(
   db: SqliteDb,
@@ -331,16 +361,11 @@ export function submitPreferences(
   submittedAt: string;
   warnings: ValidationIssue[];
 } {
-  const batch = db.prepare('SELECT id, status, term FROM selection_batches WHERE id = ?').get(batchId) as
-    | { id: number; status: string; term: string }
+  const batch = db.prepare('SELECT id, status, term, open_at, close_at FROM selection_batches WHERE id = ?').get(batchId) as
+    | { id: number; status: string; term: string; open_at: string | null; close_at: string | null }
     | undefined;
   if (!batch) throw notFound('批次不存在');
-  if (batch.status === 'frozen' || batch.status === 'published' || batch.status === 'closed') {
-    throw new AppError(ERROR_CODES.SUBMISSION_CLOSED, '本轮志愿已截止，不能再提交', 409);
-  }
-  if (batch.status === 'preparing') {
-    throw new AppError(ERROR_CODES.SUBMISSION_CLOSED, '资料准备阶段尚未开放志愿提交', 409);
-  }
+  assertSubmissionWindow(batch);
 
   const validation = validateDraft(db, studentId, batchId, payload);
   if (!validation.ok) {
@@ -476,13 +501,11 @@ export function withdrawPreferences(
   batchId: number,
   actor: AuthUser,
 ): { withdrawn: number } {
-  const batch = db.prepare('SELECT id, status FROM selection_batches WHERE id = ?').get(batchId) as
-    | { id: number; status: string }
+  const batch = db.prepare('SELECT id, status, open_at, close_at FROM selection_batches WHERE id = ?').get(batchId) as
+    | { id: number; status: string; open_at: string | null; close_at: string | null }
     | undefined;
   if (!batch) throw notFound('批次不存在');
-  if (batch.status === 'frozen' || batch.status === 'published' || batch.status === 'closed') {
-    throw new AppError(ERROR_CODES.SUBMISSION_CLOSED, '本轮已截止，不能再撤回志愿', 409);
-  }
+  assertSubmissionWindow(batch);
   const now = nowIso();
   const info = db
     .prepare(

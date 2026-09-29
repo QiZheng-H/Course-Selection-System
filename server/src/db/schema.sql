@@ -1,4 +1,16 @@
 -- =====================================================================
+-- 选课系统数据库结构 v1（对应迁移 001_init.sql）
+--
+-- 注意：这里只是 001 的基线结构。后续结构变更以 src/db/migrations/ 下的迁移为准：
+--   002 term_required_courses
+--   003 preference_drafts
+--   004 data_versions.scope 扩展与 preallocation_results 外键修正
+--   005 source_confirmations.version_id 允许为空
+--   006 guarantee_authorizations、waitlist_entries.position_reason/source、
+--       allocation_runs.request_hash/published_at/source_run_id、background_tasks
+-- 完整数据字典见 docs/数据库设计.md。
+-- =====================================================================
+-- =====================================================================
 -- 选课系统数据库结构 v1
 -- 目标：SQLite (better-sqlite3)，单机单后端实例
 -- 设计原则：

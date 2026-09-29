@@ -4,10 +4,10 @@ import { api } from '@/api/client';
 import { askConfirm } from '@/stores/confirm';
 import { reportApiError, useToast } from '@/stores/toast';
 import type {
+  AuthorizationRow,
   BatchDto,
-  ClassDto,
   CourseDto,
-  EnrolledRow,
+  GuaranteeAuthorizationRow,
   GuaranteeConfirmResult,
   GuaranteePayload,
   UserRow,
@@ -29,16 +29,10 @@ const confirmForm = reactive({ courseId: null as number | null, reason: '' });
 const confirming = ref(false);
 const lastSuggestion = ref<GuaranteeConfirmResult | null>(null);
 
-const authForm = reactive({
-  studentId: null as number | null,
-  sourceClassId: null as number | null,
-  targetCourseId: null as number | null,
-  targetClassId: null as number | null,
-  expiresAt: '',
-});
-const studentEnrollments = ref<EnrolledRow[]>([]);
-const targetClasses = ref<ClassDto[]>([]);
-const granting = ref(false);
+/** 管理员只读查看授权：替换授权与毕业兜底授权都必须由学生本人确认 */
+const authorizationRows = ref<AuthorizationRow[]>([]);
+const guaranteeAuthorizationRows = ref<GuaranteeAuthorizationRow[]>([]);
+const authorizationNotice = ref('');
 
 const infeasibleStudents = computed(() => (payload.value?.feasibility.students ?? []).filter((student) => !student.feasible));
 
@@ -146,73 +140,23 @@ async function confirmGuarantee(): Promise<void> {
   }
 }
 
-async function onAuthStudentChange(): Promise<void> {
-  authForm.sourceClassId = null;
-  studentEnrollments.value = [];
-  if (authForm.studentId === null) return;
+async function loadAuthorizations(): Promise<void> {
   try {
-    const data = await api.get<{ enrolled: EnrolledRow[] }>('/student/records', { studentId: authForm.studentId });
-    studentEnrollments.value = data.enrolled;
+    const data = await api.get<{
+      authorizations: AuthorizationRow[];
+      guaranteeAuthorizations: GuaranteeAuthorizationRow[];
+      notice: string;
+    }>('/admin/guarantee/authorizations', { batchId: batchId.value ?? undefined });
+    authorizationRows.value = data.authorizations;
+    guaranteeAuthorizationRows.value = data.guaranteeAuthorizations;
+    authorizationNotice.value = data.notice;
   } catch (error) {
-    reportApiError(error, '读取该学生的已选课程失败');
-  }
-}
-
-async function onAuthTargetCourseChange(): Promise<void> {
-  authForm.targetClassId = null;
-  targetClasses.value = [];
-  if (authForm.targetCourseId === null) return;
-  try {
-    const data = await api.get<{ items: ClassDto[] }>('/admin/classes', { courseId: authForm.targetCourseId, pageSize: 100 });
-    targetClasses.value = data.items;
-  } catch (error) {
-    reportApiError(error, '读取目标教学班失败');
-  }
-}
-
-async function grantAuthorization(): Promise<void> {
-  if (batchId.value === null || authForm.studentId === null || authForm.sourceClassId === null || authForm.targetCourseId === null) {
-    toast.warning('请完整选择学生、原教学班与目标课程');
-    return;
-  }
-  const source = studentEnrollments.value.find((row) => row.classId === authForm.sourceClassId);
-  const target = courses.value.find((item) => item.id === authForm.targetCourseId);
-  const ok = await askConfirm({
-    title: '授予自动替换授权',
-    message: '授权表示允许系统用“目标课程”替换学生当前的原教学班。授权带版本，关键资料变化后会自动失效。',
-    details: [
-      `学生：${authForm.studentId}`,
-      `原教学班：${source ? `${source.courseCode} ${source.courseName}（${source.classId}）` : authForm.sourceClassId}`,
-      `目标课程：${target ? `${target.code} ${target.name}` : authForm.targetCourseId}`,
-      authForm.targetClassId ? `目标教学班：${authForm.targetClassId}` : '目标教学班：不限',
-    ],
-    confirmText: '授予授权',
-    danger: false,
-  });
-  if (!ok) return;
-  granting.value = true;
-  try {
-    const result = await api.post<{ id: number; status: string }>('/admin/guarantee/authorizations', {
-      studentId: authForm.studentId,
-      batchId: batchId.value,
-      sourceClassId: authForm.sourceClassId,
-      targetCourseId: authForm.targetCourseId,
-      targetClassId: authForm.targetClassId ?? undefined,
-      expiresAt: authForm.expiresAt ? new Date(authForm.expiresAt).toISOString() : undefined,
-    });
-    toast.success('授权已授予', [`授权 #${result.id}（${result.status}）`]);
-    authForm.sourceClassId = null;
-    authForm.targetCourseId = null;
-    authForm.targetClassId = null;
-  } catch (error) {
-    reportApiError(error, '授予授权失败');
-  } finally {
-    granting.value = false;
+    reportApiError(error, '读取授权失败');
   }
 }
 
 onMounted(async () => {
-  await Promise.all([loadReferenceData(), loadBatches()]);
+  await Promise.all([loadReferenceData(), loadBatches(), loadAuthorizations()]);
 });
 </script>
 
@@ -442,50 +386,64 @@ onMounted(async () => {
 
     <section class="card">
       <div class="card__header">
-        <h3 class="card__title">授予替换（升级）授权</h3>
+        <h3 class="card__title">授权查看（只读）</h3>
+        <button class="btn btn--ghost btn--sm" type="button" @click="loadAuthorizations">刷新</button>
       </div>
-      <p class="tips">必须选择“原教学班”和“目标课程”；可选目标教学班与过期时间。学生当前必须仍在修读原教学班，否则后端会拒绝。</p>
-      <div class="grid grid--3">
-        <label class="field">
-          <span class="field__label">学生</span>
-          <select v-model.number="authForm.studentId" class="select" @change="onAuthStudentChange">
-            <option :value="null">请选择学生</option>
-            <option v-for="student in students" :key="student.id" :value="student.id">
-              {{ student.studentNo ?? student.username }} {{ student.displayName }}
-            </option>
-          </select>
-        </label>
-        <label class="field">
-          <span class="field__label">原教学班（该学生当前在修）</span>
-          <select v-model.number="authForm.sourceClassId" class="select">
-            <option :value="null">请选择原教学班</option>
-            <option v-for="row in studentEnrollments" :key="row.classId" :value="row.classId">
-              {{ row.courseCode }} {{ row.courseName }} · 教学班 {{ row.classId }}
-            </option>
-          </select>
-        </label>
-        <label class="field">
-          <span class="field__label">目标课程</span>
-          <select v-model.number="authForm.targetCourseId" class="select" @change="onAuthTargetCourseChange">
-            <option :value="null">请选择目标课程</option>
-            <option v-for="course in courses" :key="course.id" :value="course.id">{{ course.code }} {{ course.name }}</option>
-          </select>
-        </label>
-        <label class="field">
-          <span class="field__label">目标教学班（可选，不限则留空）</span>
-          <select v-model.number="authForm.targetClassId" class="select">
-            <option :value="null">不限</option>
-            <option v-for="cls in targetClasses" :key="cls.id" :value="cls.id">{{ cls.classCode }}（余 {{ cls.generalAvailable }}）</option>
-          </select>
-        </label>
-        <label class="field">
-          <span class="field__label">过期时间（可选）</span>
-          <input v-model="authForm.expiresAt" class="input" type="datetime-local" />
-        </label>
+      <p class="tips">
+        {{ authorizationNotice || '替换授权与毕业兜底授权都必须由学生本人在“结果与候补”页确认；管理员确认毕业资格不能代替学生同意退换课程。' }}
+      </p>
+
+      <h4 class="card__title">课程替换授权</h4>
+      <div v-if="authorizationRows.length === 0" class="muted">当前批次没有替换授权。</div>
+      <div v-else class="table-wrap">
+        <table class="table table--compact">
+          <thead>
+            <tr>
+              <th>学生</th>
+              <th>原课程</th>
+              <th>目标课程</th>
+              <th>状态</th>
+              <th>过期时间</th>
+              <th>使用时间</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in authorizationRows" :key="row.id">
+              <td>{{ row.studentName }}<div class="mono small">{{ row.studentNo }}</div></td>
+              <td>{{ row.sourceCourseName }}</td>
+              <td>{{ row.targetCourseName }}</td>
+              <td><span class="badge" :class="row.status === 'active' ? 'badge--ok' : 'badge--muted'">{{ row.status }}</span></td>
+              <td class="small muted">{{ formatDateTime(row.expiresAt) }}</td>
+              <td class="small muted">{{ formatDateTime(row.usedAt) }}</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
-      <button class="btn btn--primary" type="button" :disabled="granting" @click="grantAuthorization">
-        {{ granting ? '授予中…' : '授予授权' }}
-      </button>
+
+      <h4 class="card__title" style="margin-top: 12px">毕业兜底授权</h4>
+      <div v-if="guaranteeAuthorizationRows.length === 0" class="muted">当前批次没有毕业兜底授权。</div>
+      <div v-else class="table-wrap">
+        <table class="table table--compact">
+          <thead>
+            <tr>
+              <th>学生</th>
+              <th>课程</th>
+              <th>接受的教学班</th>
+              <th>状态</th>
+              <th>过期时间</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in guaranteeAuthorizationRows" :key="row.id">
+              <td class="mono small">{{ row.studentId }}</td>
+              <td>{{ row.courseName }}</td>
+              <td class="mono small">{{ row.classIds }}</td>
+              <td><span class="badge" :class="row.status === 'active' ? 'badge--ok' : 'badge--muted'">{{ row.status }}</span></td>
+              <td class="small muted">{{ formatDateTime(row.expiresAt) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
     </section>
   </div>
 </template>

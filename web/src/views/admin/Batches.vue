@@ -140,7 +140,7 @@ async function transition(batch: BatchDto): Promise<void> {
   const ok = await askConfirm({
     title: '变更批次状态',
     message: force.value
-      ? '强制流转会绕过“必需配置缺失 / 资料未确认 / 关键异常未处理”等保护性校验。'
+      ? '强制流转会绕过“必需配置缺失 / 资料未确认”等保护性校验（发布环节的校验不能强制绕过）。'
       : '状态流转会立即影响学生端可用的操作，是否继续？',
     details,
     confirmText: force.value ? '强制执行' : '确认流转',
@@ -327,10 +327,10 @@ onMounted(load);
               </button>
             </div>
             <p v-if="force" class="alert alert--error small" style="margin-top: 8px">
-              风险提示：强制执行会绕过“必需配置缺失 / 已提交志愿但资料未确认 / 关键保障异常未处理”等保护。发布环节若有关键异常未处理，强制发布可能导致保障名单无法兑现，请确认已形成明确处理结果。
+              风险提示：强制执行只绕过“必需配置缺失 / 已提交志愿但资料未确认”等前置校验。发布环节不能强制绕过：必须先试算、处理关键保障异常，再在“预分配与统一分配”页发布指定的试算结果。
             </p>
             <p class="tips" style="margin-top: 6px">
-              常见失败原因：必需配置缺失（BATCH_CONFIG_MISSING，需先在“资料核对/配置”补齐学分上限与教学班数据）；资料待确认（MATERIAL_NOT_CONFIRMED，需学生先确认修读记录）；状态不允许（BATCH_STATE_INVALID，需按合法顺序流转或显式强制执行）。
+              常见失败原因：必需配置缺失（BATCH_CONFIG_MISSING，需先在“资料核对/配置”补齐学分上限与教学班数据）；资料待确认（MATERIAL_NOT_CONFIRMED，需学生先确认修读记录）；状态不允许（BATCH_STATE_INVALID，需按合法顺序流转；发布需先有成功发布的分配结果）。提交与撤回还会按服务器时间校验管理员配置的开放/截止时刻，未到点或已过点都会被拒绝（SUBMISSION_CLOSED）。
             </p>
           </div>
         </div>
