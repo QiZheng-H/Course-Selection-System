@@ -9,15 +9,25 @@ const route = useRoute();
 const session = useSession();
 const toast = useToast();
 
+/**
+ * 学生端菜单顺序 = 学生的实际操作顺序：
+ *   ① 先了解（概览 → 培养方案 → 修读记录：我该修什么、已经修了什么）
+ *   ② 再动手（课程检索 → 志愿：有什么课可选、我要按什么顺序申请）
+ *   ③ 后看结果（我的课表 → 结果与候补：落实了什么、竞争结果与候补顺位）
+ *   ④ 辅助规划（偏好与规划：属于软性参考，放最后不影响主流程）
+ *
+ * 注意「我的课表」必须在「结果与候补」之后：课表只反映已经落实的课，
+ * 首轮结果发布前它是空的，排在前面会让学生以为出了错。
+ */
 const studentLinks = [
   { name: 'student-dashboard', label: '概览' },
+  { name: 'student-program', label: '培养方案' },
+  { name: 'student-records', label: '修读记录' },
   { name: 'student-courses', label: '课程检索' },
   { name: 'student-preferences', label: '志愿' },
   { name: 'student-timetable', label: '我的课表' },
   { name: 'student-results', label: '结果与候补' },
-  { name: 'student-records', label: '修读记录' },
   { name: 'student-plan', label: '偏好与规划' },
-  { name: 'student-program', label: '培养方案' },
 ];
 
 const adminLinks = [
