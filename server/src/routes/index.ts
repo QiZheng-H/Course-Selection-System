@@ -21,6 +21,8 @@ import * as catalogService from '../modules/catalog/service.js';
 import * as curriculumService from '../modules/curriculum/service.js';
 import * as rulesService from '../modules/rules/service.js';
 import * as batchService from '../modules/batch/service.js';
+import * as batchStageService from '../modules/batch/stage.js';
+import * as batchActionsService from '../modules/batch/actions.js';
 import * as preferenceService from '../modules/preference/service.js';
 import * as enrollmentServiceModule from '../modules/enrollment/service.js';
 import * as allocationService from '../modules/allocation/service.js';
@@ -37,6 +39,11 @@ const { EnrollmentService, registerWaitlistPromotion, registerStudentChangeReche
 registerWaitlistPromotion((db, classId) => waitlistService.promoteWaitlistForClass(db, classId));
 /** 选退课/授权/资料确认后重新评估候补 */
 registerStudentChangeRecheck((db, studentId, batchId) => waitlistService.onStudentScheduleChanged(db, studentId, batchId));
+/**
+ * “结束提交并检查”必须同时生成冻结快照，快照逻辑在分配模块。
+ * 用注册回调注入，避免 batch 模块与 allocation 模块循环依赖。
+ */
+batchService.registerFreezeHandler((db, batchId, actor, options) => allocationService.freezeBatch(db, batchId, actor, options));
 
 /** 授权或资料变化后重新评估候补（不影响主流程） */
 function safeRecheckWaitlist(db: SqliteDb, studentId: number, batchId: number | null | undefined, actor?: AuthUser): void {
@@ -259,6 +266,15 @@ function mountStudent(app: Express): void {
     return { batches: batchService.listBatches(db), current: batchService.getCurrentBatch(db) };
   });
 
+  /**
+   * 学生端当前阶段（含“能否提交志愿 / 能否选退课 / 退改选是否开放”）。
+   * 学生页面用同一个结果判断按钮状态，因此管理员切换阶段后不会出现“按钮还亮着但请求被拒”。
+   */
+  handle(router, 'get', '/active-stage', requireAuth, async (req) => {
+    const db = req.ctx.db;
+    return { stage: batchStageService.buildStudentStage(db) };
+  });
+
   app.use('/api/student', router);
 }
 
@@ -435,19 +451,20 @@ function mountEnrollment(app: Express): void {
       ? waitlistService.canPublicSupplement(db, currentBatch.id, cls.courseId)
       : { allowed: false, reason: '当前没有进行中的选课批次', qualifiedWaitlist: 0, protectedSeats: 0 };
     // 没有进行中的批次时，选课本身也会被服务层拒绝；这里如实说明原因，而不是报一个看不懂的 404
-    const batchOpen = Boolean(currentBatch && ['published', 'waitlist'].includes(currentBatch.status));
+    // 只有管理员开放退改选（waitlist）后才能正式选退课；结果发布后、开放前只能查看
+    const batchOpen = Boolean(currentBatch && batchService.canStudentEnroll(currentBatch.status));
     const stageHint: Record<string, string> = {
-      preparing: '资料准备阶段，暂时不能提交志愿',
-      preview: '预览阶段，可以保存并提交志愿',
-      open: '正式受理阶段：请先提交志愿，正式选退课在结果发布后开放',
-      frozen: '已截止冻结，分配期间不能改选',
-      published: '结果已发布，可以选退课与查看候补',
-      waitlist: '候补与退选阶段，可以选退课',
-      closed: '批次已结束',
+      preparing: '管理员还没有开放预选',
+      preview: '请先提交志愿；正式选退课在管理员开放退改选之后',
+      open: '请先提交志愿；正式选退课在管理员开放退改选之后',
+      frozen: '已结束志愿提交，管理员正在生成并发布分配方案',
+      published: '首轮结果已公布，但管理员尚未开放退改选，现在只能查看结果',
+      waitlist: '可以选课、退课、换班与查看候补',
+      closed: '本次选课已结束',
     };
     const reasons: string[] = [];
-    if (!currentBatch) reasons.push('当前没有进行中的选课批次，请等待管理员开放');
-    else if (!batchOpen) reasons.push(`批次当前状态为「${currentBatch.status}」：${stageHint[currentBatch.status] ?? '暂未开放正式选退课'}`);
+    if (!currentBatch) reasons.push('当前没有进行中的选课活动，请等待管理员开放');
+    else if (!batchOpen) reasons.push(`当前选课活动处于「${batchService.batchStateLabel(currentBatch.status)}」：${stageHint[currentBatch.status] ?? '管理员尚未开放正式选退课'}`);
     if (cls.status !== 'open') reasons.push('该教学班当前未开放');
     if (cls.generalAvailable <= 0) {
       reasons.push(
@@ -674,7 +691,10 @@ function mountWaitlist(app: Express): void {
         ...entry,
         suspendHint: waitlistService.describeSuspendReason(entry.suspendCode),
       })),
-      canEdit: batch.status !== 'frozen' && batch.status !== 'closed' && batch.status !== 'preparing',
+      canEdit: batchService.canWaitlistOperate(batch.status),
+      stageHint: batch.status === 'published'
+        ? '首轮结果已公布，管理员尚未开放退改选：现在只能查看结果与候补顺位，候补不会递补'
+        : undefined,
     };
   });
 
@@ -970,6 +990,22 @@ function mountAdmin(app: Express): void {
     );
   });
 
+  // ---- 选课工作台（阶段 / 允许动作 / 阻塞原因 / 待办）----
+  handle(router, 'get', '/workbench', async (req) => {
+    const db = req.ctx.db;
+    return batchStageService.buildWorkbench(db, num(req.query.batchId));
+  });
+
+  handle(router, 'get', '/batches/:batchId/not-submitted', async (req) => {
+    const db = req.ctx.db;
+    const { page, pageSize, offset } = pagination(req.query as Record<string, unknown>, 50);
+    const result = batchStageService.listNotSubmitted(db, idParam(req.params.batchId, 'batchId'), {
+      limit: pageSize,
+      offset,
+    });
+    return { ...result, page, pageSize };
+  });
+
   // ---- 批次控制 ----
   handle(router, 'get', '/batches', async (req) => {
     const db = req.ctx.db;
@@ -1010,13 +1046,26 @@ function mountAdmin(app: Express): void {
 
   handle(router, 'post', '/batches/:batchId/transition', async (req) => {
     const db = req.ctx.db;
+    // 通用流转只保留兼容：不再接受 force 绕过校验，
+    // 常规管理请使用 /batches/:batchId/actions/:action 下的业务动作。
     return batchService.transitionBatch(
       db,
       idParam(req.params.batchId, 'batchId'),
       str(req.body?.status) as never,
       req.ctx.user!,
-      { force: bool(req.body?.force, false), reason: str(req.body?.reason) || undefined },
+      { reason: str(req.body?.reason) || undefined },
     );
+  });
+
+  /**
+   * 命名业务动作（面向管理员的“下一步按钮”）。
+   * 所有校验都在服务端完成，前端隐藏控件之外也无法绕过阶段限制。
+   */
+  handle(router, 'post', '/batches/:batchId/actions/:action', async (req) => {
+    const db = req.ctx.db;
+    const batchId = idParam(req.params.batchId, 'batchId');
+    const action = str(req.params.action);
+    return batchActionsService.runNamedAction(db, batchId, action, req.ctx.user!, (req.body ?? {}) as Record<string, unknown>);
   });
 
   handle(router, 'get', '/batches/:batchId/submissions', async (req) => {
@@ -1048,9 +1097,9 @@ function mountAdmin(app: Express): void {
 
   handle(router, 'post', '/batches/:batchId/freeze', async (req) => {
     const db = req.ctx.db;
-    return allocationService.freezeBatch(db, idParam(req.params.batchId, 'batchId'), req.ctx.user!, {
-      force: bool(req.body?.force, false),
-    });
+    // 不再支持 force：需要重新开始时必须走“重新开放志愿提交”，
+    // 这样旧快照与旧方案会被统一标记失效。
+    return allocationService.freezeBatch(db, idParam(req.params.batchId, 'batchId'), req.ctx.user!);
   });
 
   handle(router, 'post', '/batches/:batchId/allocate', async (req) => {
@@ -1163,7 +1212,52 @@ function mountAdmin(app: Express): void {
       )
       .all(...params);
     const feasibility = curriculumService.checkGuaranteeForBatch(db, batchId ?? null);
-    return { reservations: rows, feasibility };
+    /**
+     * 缺少兜底授权的学生（按“学生 × 课程”逐条判断）。
+     * 管理端只能用这个数字做待办提示：兜底授权必须由学生本人确认，
+     * 管理员不能代替学生同意退换课，因此这里只返回名单，不提供代建入口。
+     */
+    const gapRows = batchId
+      ? (db
+          .prepare(
+            `SELECT gr.student_id AS studentId, s.student_no AS studentNo, s.name AS studentName,
+                    c.id AS courseId, c.name AS courseName
+             FROM graduation_reservations gr
+             JOIN courses c ON c.id = gr.course_id
+             JOIN students s ON s.user_id = gr.student_id
+             WHERE gr.batch_id = ? AND gr.status = 'active'
+               AND NOT EXISTS (
+                 SELECT 1 FROM guarantee_authorizations ga
+                 WHERE ga.student_id = gr.student_id AND ga.batch_id = gr.batch_id
+                   AND ga.course_id = gr.course_id AND ga.status = 'active'
+               )
+             ORDER BY s.student_no, c.name`,
+          )
+          .all(batchId) as Array<{
+          studentId: number;
+          studentNo: string;
+          studentName: string;
+          courseId: number;
+          courseName: string;
+        }>)
+      : [];
+    const gapByStudent = new Map<
+      number,
+      { studentId: number; studentNo: string; studentName: string; courses: string[] }
+    >();
+    for (const gap of gapRows) {
+      const entry =
+        gapByStudent.get(gap.studentId) ??
+        { studentId: gap.studentId, studentNo: gap.studentNo, studentName: gap.studentName, courses: [] as string[] };
+      entry.courses.push(gap.courseName);
+      gapByStudent.set(gap.studentId, entry);
+    }
+    const authorizationGaps = {
+      studentCount: gapByStudent.size,
+      courseCount: new Set(gapRows.map((gap) => gap.courseId)).size,
+      students: Array.from(gapByStudent.values()),
+    };
+    return { reservations: rows, feasibility, authorizationGaps };
   });
 
   handle(router, 'post', '/guarantee', async (req) => {

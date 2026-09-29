@@ -56,6 +56,176 @@ export interface BatchDto {
   snapshotHash: string | null;
   configReady: boolean;
   configIssues: string[];
+  /** 阶段版本：重新开放志愿提交会 +1 */
+  stageRevision?: number;
+  reopenCount?: number;
+  lastReopenedAt?: string | null;
+  lastReopenReason?: string | null;
+  hasActiveSnapshot?: boolean;
+  publishedRunId?: number | null;
+}
+
+/* --------------------------- 选课工作台 --------------------------- */
+
+export type StageKey =
+  | 'no_activity'
+  | 'materials'
+  | 'preference_open'
+  | 'plan_pending'
+  | 'plan_ready'
+  | 'result_published'
+  | 'change_open'
+  | 'closed';
+
+export type ActionKey =
+  | 'create_activity'
+  | 'open_preference'
+  | 'close_submission'
+  | 'generate_plan'
+  | 'publish_result'
+  | 'open_change'
+  | 'close_activity'
+  | 'reopen_submission'
+  | 'adjust_deadline'
+  | 'review_result';
+
+export type BlockerFix =
+  | 'config'
+  | 'materials'
+  | 'confirmations'
+  | 'exceptions'
+  | 'guarantee'
+  | 'submissions'
+  | 'users'
+  | 'preallocations';
+
+export interface WorkbenchBlocker {
+  code: string;
+  message: string;
+  fix?: BlockerFix;
+  fixLabel?: string;
+  count?: number;
+  severity: 'block' | 'warning';
+}
+
+export interface WorkbenchAction {
+  key: ActionKey;
+  label: string;
+  description: string;
+  primary: boolean;
+  enabled: boolean;
+  input: 'closeAt' | 'runId' | null;
+  blockers: WorkbenchBlocker[];
+}
+
+export interface WorkbenchTodo {
+  key: string;
+  title: string;
+  detail: string;
+  count: number;
+  severity: 'critical' | 'warning' | 'info';
+  fix?: BlockerFix;
+  fixLabel: string;
+  items: Array<{ label: string; sub?: string }>;
+}
+
+export interface WorkbenchPlan {
+  runId: number | null;
+  status: string | null;
+  attempt: number | null;
+  publishedAt: string | null;
+  invalidated: boolean;
+  generatedAt: string | null;
+  report: {
+    allocated: number;
+    rejected: number;
+    guaranteeFulfilled: number;
+    releasedReservedSeats: number;
+  } | null;
+}
+
+export interface WorkbenchTask {
+  id: number;
+  status: string;
+  percent: number;
+  errorMessage: string | null;
+  createdAt: string;
+}
+
+export interface WorkbenchStep {
+  key: 'materials' | 'preference' | 'allocation' | 'change' | 'closed';
+  label: string;
+  state: 'done' | 'active' | 'todo';
+}
+
+export interface WorkbenchChecklistItem {
+  key: 'classes' | 'program' | 'preallocation' | 'guarantee';
+  label: string;
+  value: string;
+  done: boolean;
+  fix?: BlockerFix;
+  fixLabel?: string;
+}
+
+export interface WorkbenchActivityRow {
+  id: number;
+  actorName: string | null;
+  summary: string;
+  createdAt: string;
+}
+
+export interface WorkbenchDto {
+  batchId: number | null;
+  batch: BatchDto | null;
+  stage: {
+    key: StageKey;
+    label: string;
+    studentCan: string[];
+    nextStep: string;
+    admissionOpen: boolean;
+  };
+  primaryAction: WorkbenchAction | null;
+  actions: WorkbenchAction[];
+  blockers: WorkbenchBlocker[];
+  todos: WorkbenchTodo[];
+  /** 顶部五段进度：资料准备 → 预选提交 → 分配与发布 → 退改选 → 结束 */
+  steps: WorkbenchStep[];
+  /** 本轮准备情况清单 */
+  checklist: WorkbenchChecklistItem[];
+  /** 最近操作 */
+  recentActivity: WorkbenchActivityRow[];
+  stats: {
+    totalStudents: number;
+    submittedStudents: number;
+    notSubmittedStudents: number;
+    submitted: number;
+    withdrawn: number;
+    pendingConfirmations: number;
+    pendingConfirmationSample: Array<{ studentNo: string; name: string }>;
+    waitlistQueued: number;
+    waitlistSuspended: number;
+    openExceptions: number;
+    criticalExceptions: number;
+  };
+  plan: WorkbenchPlan | null;
+  config: { ready: boolean; issues: string[] };
+  tasks: WorkbenchTask[];
+  counts: { runs: number; invalidatedRuns: number; snapshots: number; preallocations: number };
+}
+
+export interface StudentStageDto {
+  batchId: number | null;
+  batchName: string | null;
+  term: string | null;
+  status: BatchStatus | null;
+  stageKey: StageKey;
+  stageLabel: string;
+  studentCan: string[];
+  admissionOpen: boolean;
+  canSubmitPreference: boolean;
+  canUseWaitlist: boolean;
+  closeAt: string | null;
+  publishedAt: string | null;
 }
 
 /* --------------------------- 课程 / 教学班 --------------------------- */

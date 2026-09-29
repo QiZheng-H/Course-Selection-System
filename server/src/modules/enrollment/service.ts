@@ -616,18 +616,27 @@ export class EnrollmentService {
           .get() as { id: number; status: string } | undefined);
     // 首轮之前（preparing / preview / open / frozen）与结束后都不允许直接占用或释放名额
     if (!row) {
-      throw new AppError(ERROR_CODES.BATCH_STATE_INVALID, '当前没有开放正式选退课的批次，请等待结果发布', 409);
+      throw new AppError(ERROR_CODES.BATCH_STATE_INVALID, '当前没有开放正式选退课的选课活动，请等待管理员开放', 409);
     }
-    if (row.status === 'published' || row.status === 'waitlist') return;
+    // 只有管理员主动“开放退改选”（waitlist 阶段）后才允许正式选退换课。
+    // 首轮结果刚发布（published）时学生只能查看结果，这是与发布相互独立的动作。
+    if (row.status === 'waitlist') return;
+    if (row.status === 'published') {
+      throw new AppError(
+        ERROR_CODES.BATCH_STATE_INVALID,
+        '首轮结果已公布，管理员尚未开放退改选：现在只能查看结果，暂时不能选课或退课',
+        409,
+      );
+    }
     if (row.status === 'frozen') {
-      throw new AppError(ERROR_CODES.BATCH_FROZEN, '本轮已截止冻结，分配期间不能改选', 409);
+      throw new AppError(ERROR_CODES.BATCH_FROZEN, '本轮已结束志愿提交，方案生成与发布期间不能改选', 409);
     }
     if (row.status === 'closed') {
-      throw new AppError(ERROR_CODES.BATCH_STATE_INVALID, '批次已结束，不能再改选', 409);
+      throw new AppError(ERROR_CODES.BATCH_STATE_INVALID, '本次选课已结束，不能再改选', 409);
     }
     throw new AppError(
       ERROR_CODES.BATCH_STATE_INVALID,
-      `批次当前状态为「${row.status}」：正式选退课在首轮结果发布后才开放`,
+      `当前处于「${row.status === 'preparing' ? '资料准备' : '预选进行中'}」阶段：正式选退课在管理员开放退改选之后才可用`,
       409,
     );
   }

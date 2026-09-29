@@ -300,7 +300,7 @@ function parsedSummary(): Array<{ label: string; value: string }> {
 
     <section v-if="parsed" class="card">
       <div class="card__header">
-        <h3 class="card__title">偏好解析结果（POST /api/agent/parse）</h3>
+        <h3 class="card__title">偏好解析结果</h3>
       </div>
       <div class="kv">
         <template v-for="row in parsedSummary()" :key="row.label">

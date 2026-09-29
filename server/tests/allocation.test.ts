@@ -212,14 +212,14 @@ describe('统一分配：排序、容量与可重试', () => {
         ctx.db.prepare('SELECT student_no FROM students WHERE user_id = ?').get(duplicated.student_id) as { student_no: string }
       ).student_no;
       const cookie = (await loginMany([studentNo])).get(studentNo)!;
-      // 此时批次仍处于冻结状态，因此最先返回的是 BATCH_FROZEN；
-      // 无论触发哪条保护，都必须被拒绝（防重复选课另见固定随机键与容量用例）。
+      // 发布结果后、开放退改选前：学生只能查看结果，正式选退课被阶段限制拒绝
+      // （防重复选课的规则另见固定随机键与容量用例）。
       const again = await request(ctx.app)
         .post('/api/enroll')
         .set(authHeader(cookie))
         .send({ classId: duplicated.class_id, idempotencyKey: `dup-${studentNo}` });
       expect(again.status).toBe(409);
-      expect(['BATCH_FROZEN', 'DUPLICATE_COURSE']).toContain(again.body.error.code);
+      expect(again.body.error.code).toBe('BATCH_STATE_INVALID');
     }
   });
 
