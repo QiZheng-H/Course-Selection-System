@@ -31,7 +31,7 @@ async function submit(): Promise<void> {
     if (redirect) {
       await router.push(redirect);
     } else {
-      await router.push(user.role === 'admin' ? { name: 'admin-home' } : { name: 'student-dashboard' });
+      await router.push(user.role === 'admin' ? { name: 'admin-workspace' } : { name: 'student-dashboard' });
     }
   } catch (error) {
     const info = apiErrorInfo(error, '登录失败');
@@ -46,6 +46,17 @@ async function submit(): Promise<void> {
 <template>
   <div class="login">
     <form class="login__card" @submit.prevent="submit">
+      <div class="login__brand">
+        <span class="login__logo">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 21c0-6 2-10 8-12-1 8-5 12-8 12zM12 21c0-4-1-7-5-9 0 6 2 9 5 9z" />
+          </svg>
+        </span>
+        <span>
+          <span class="login__brand-name">课间</span>
+          <span class="login__brand-sub">Campus Planner</span>
+        </span>
+      </div>
       <h1 class="login__title">大学选课系统</h1>
       <p class="login__subtitle">学生与管理员使用同一个入口，用用户名登录。</p>
 
@@ -67,9 +78,7 @@ async function submit(): Promise<void> {
         {{ submitting ? '登录中…' : '登录' }}
       </button>
 
-      <p class="login__hint">
-        会话使用 httpOnly Cookie 保存在浏览器中；登录状态失效时系统会自动返回本页，本页不会保存任何口令。
-      </p>
+      <p class="login__hint">登录状态保存在浏览器会话中；失效时系统会自动返回本页，本页不会保存任何口令。</p>
     </form>
   </div>
 </template>

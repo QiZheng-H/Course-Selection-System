@@ -38,6 +38,7 @@ import {
   previewStatusLabel,
 } from '@/utils/labels';
 import TimetableGrid from '@/components/TimetableGrid.vue';
+import CourseSearchPanel from '@/components/CourseSearchPanel.vue';
 
 interface EditablePreference extends DraftPreference {
   courseCode: string;
@@ -87,9 +88,6 @@ const randomKeys = ref<RandomKeyRow[]>([]);
 const randomKeyTerm = ref('');
 const loadingKeys = ref(false);
 
-const courseSearchKeyword = ref('');
-const courseSearchResults = ref<CourseDto[]>([]);
-const searchingCourses = ref(false);
 
 /** 备选选择器当前展开在哪一门主课程上 */
 const altPickerFor = ref<number | null>(null);
@@ -370,21 +368,6 @@ async function loadBatches(): Promise<void> {
 }
 
 /* ------------------------------ 第 1 步：选课 ------------------------------ */
-
-async function searchCourses(): Promise<void> {
-  searchingCourses.value = true;
-  try {
-    const data = await api.get<{ items: CourseDto[] }>('/courses', {
-      keyword: courseSearchKeyword.value.trim() || undefined,
-      pageSize: 20,
-    });
-    courseSearchResults.value = data.items;
-  } catch (error) {
-    reportApiError(error, '搜索课程失败');
-  } finally {
-    searchingCourses.value = false;
-  }
-}
 
 async function addCourse(course: CourseDto): Promise<void> {
   if (inDraft(course.id)) {
@@ -927,47 +910,21 @@ onMounted(loadBatches);
         <span class="muted small">这一步不用排顺序，先把想上的都加进来</span>
       </div>
 
-      <div class="grid grid--2">
-        <div class="card card--flat">
-          <h4 class="card__title">课程检索</h4>
-          <div class="inline">
-            <input
-              v-model="courseSearchKeyword"
-              class="input"
-              type="text"
-              placeholder="课程名或课程号"
-              @keyup.enter="searchCourses"
-            />
-            <button class="btn btn--primary btn--sm" type="button" :disabled="searchingCourses" @click="searchCourses">
-              {{ searchingCourses ? '搜索中…' : '搜索' }}
-            </button>
-          </div>
-          <p v-if="courseSearchResults.length === 0" class="muted small" style="margin-top: 8px">
-            输入关键词后回车即可搜索。
-          </p>
-          <div v-else class="list" style="margin-top: 8px">
-            <div v-for="course in courseSearchResults" :key="course.id" class="list__item">
-              <div class="inline">
-                <span class="mono small">{{ course.code }}</span>
-                <span>{{ course.name }}</span>
-                <span class="badge">{{ formatCredits(course.credits) }} 学分</span>
-                <span class="spacer"></span>
-                <button class="btn btn--sm btn--primary" type="button" :disabled="inDraft(course.id)" @click="addCourse(course)">
-                  {{ inDraft(course.id) ? '已在清单' : '加入' }}
-                </button>
-              </div>
-            </div>
-          </div>
+      <div class="pref-step1">
+        <div class="pref-step1__main">
+          <!-- 完整课程检索（筛选 / 教学班详情 / 资格 / 选课·退课·换班 / 我的已选课程）
+               右上角说明由本页面提供；每门课程可“加入清单”进入右侧待排清单 -->
+          <CourseSearchPanel :in-draft="inDraft" @add="addCourse" />
         </div>
 
-        <div class="card card--flat">
+        <div class="card card--flat pref-step1__side">
           <div class="card__header">
             <h4 class="card__title">待排清单（{{ items.length }} 门）</h4>
             <button class="btn btn--primary btn--sm" type="button" :disabled="items.length === 0" @click="gotoStep(2)">
               下一步：排顺序
             </button>
           </div>
-          <p v-if="items.length === 0" class="muted">还没有加入任何课程。左侧搜索后点“加入”。</p>
+          <p v-if="items.length === 0" class="muted">还没有加入任何课程。在左侧课程列表点“加入清单”即可。</p>
           <div v-else class="list">
             <div v-for="(item, index) in sortedItems()" :key="item.courseId" class="list__item">
               <div class="inline">

@@ -1,7 +1,10 @@
 <script setup lang="ts">
+/**
+ * 应用入口：登录页之外统一使用「课间」外壳（左侧导航 + 顶栏 + 页脚）。
+ */
 import { computed } from 'vue';
 import { useRoute } from 'vue-router';
-import TopNav from '@/components/TopNav.vue';
+import AppShell from '@/components/AppShell.vue';
 import ToastHost from '@/components/ToastHost.vue';
 import ConfirmHost from '@/components/ConfirmHost.vue';
 import { useSession } from '@/stores/session';
@@ -9,14 +12,14 @@ import { useSession } from '@/stores/session';
 const route = useRoute();
 const session = useSession();
 
-const showNav = computed(() => Boolean(session.state.user) && route.name !== 'login');
+const showShell = computed(() => Boolean(session.state.user) && route.name !== 'login');
 </script>
 
 <template>
-  <TopNav v-if="showNav" />
-  <main class="app-main">
+  <AppShell v-if="showShell">
     <router-view />
-  </main>
+  </AppShell>
+  <router-view v-else />
   <ToastHost />
   <ConfirmHost />
 </template>

@@ -169,19 +169,24 @@ export function freezeBatch(
   actor: AuthUser,
   options: { force?: boolean } = {},
 ): { snapshotId: number; contentHash: string; summary: Record<string, number> } {
-  const batch = db.prepare('SELECT id, term, status FROM selection_batches WHERE id = ?').get(batchId) as
-    | { id: number; term: string; status: string }
+  const batch = db.prepare('SELECT id, term, status, stage_revision FROM selection_batches WHERE id = ?').get(batchId) as
+    | { id: number; term: string; status: string; stage_revision: number }
     | undefined;
   if (!batch) throw notFound('批次不存在');
-  if (batch.status === 'frozen' || batch.status === 'published') {
-    throw conflict('该批次已经冻结，如需重新计算请在试算/发布时新建一次执行记录');
+  if (batch.status === 'published' || batch.status === 'waitlist' || batch.status === 'closed') {
+    throw conflict('本次选课已经发布结果或结束，不能再冻结；如需继续请创建下一次选课活动');
   }
   if (batch.status === 'preparing') {
-    throw new AppError(ERROR_CODES.BATCH_STATE_INVALID, '资料准备阶段尚未开放志愿，不能冻结', 409);
+    throw new AppError(ERROR_CODES.BATCH_STATE_INVALID, '资料准备阶段尚未开放志愿，不能结束提交', 409);
   }
-  const existing = db.prepare('SELECT id FROM batch_snapshots WHERE batch_id = ?').get(batchId);
+  if (batch.status === 'frozen') {
+    throw conflict('本轮已经结束提交并生成过快照，如需重新计算请直接“生成分配方案”');
+  }
+  const existing = db
+    .prepare('SELECT id FROM batch_snapshots WHERE batch_id = ? AND invalidated_at IS NULL')
+    .get(batchId);
   if (existing && !options.force) {
-    throw conflict('该批次已有冻结快照；如需重新冻结请显式确认（会导致旧结果作废）');
+    throw conflict('本次选课已有有效的冻结快照；如需重新冻结请显式确认（会导致旧方案作废）');
   }
 
   const build = (): SnapshotPayload => {
@@ -347,12 +352,13 @@ export function freezeBatch(
   const snapshotId = db.transaction(() => {
     const info = db
       .prepare(
-        `INSERT INTO batch_snapshots (batch_id, content_hash, payload, rng_seed, frozen_by, frozen_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO batch_snapshots (batch_id, content_hash, payload, rng_seed, frozen_by, frozen_at, stage_revision, invalidated_at, invalidated_reason)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)
          ON CONFLICT (batch_id) DO UPDATE SET content_hash = excluded.content_hash, payload = excluded.payload,
-           rng_seed = excluded.rng_seed, frozen_by = excluded.frozen_by, frozen_at = excluded.frozen_at`,
+           rng_seed = excluded.rng_seed, frozen_by = excluded.frozen_by, frozen_at = excluded.frozen_at,
+           stage_revision = excluded.stage_revision, invalidated_at = NULL, invalidated_reason = NULL`,
       )
-      .run(batchId, hash, stableStringify(payload), randomToken(16), actor.id, payload.frozenAt);
+      .run(batchId, hash, stableStringify(payload), randomToken(16), actor.id, payload.frozenAt, batch.stage_revision);
     db.prepare("UPDATE selection_batches SET status = 'frozen' WHERE id = ?").run(batchId);
     return (
       Number(info.lastInsertRowid) ||
@@ -439,11 +445,18 @@ export async function runAllocation(
 ): Promise<RunResult> {
   const mode = options.mode ?? 'simulate';
   const timeoutMs = options.timeoutMs ?? 60_000;
-  const snapshot = db.prepare('SELECT id, content_hash, payload FROM batch_snapshots WHERE batch_id = ?').get(batchId) as
+  const batchRow = db.prepare('SELECT stage_revision FROM selection_batches WHERE id = ?').get(batchId) as
+    | { stage_revision: number }
+    | undefined;
+  if (!batchRow) throw notFound('选课活动不存在');
+  const startRevision = batchRow.stage_revision ?? 1;
+  const snapshot = db
+    .prepare('SELECT id, content_hash, payload FROM batch_snapshots WHERE batch_id = ? AND invalidated_at IS NULL')
+    .get(batchId) as
     | { id: number; content_hash: string; payload: string }
     | undefined;
   if (!snapshot) {
-    throw new AppError(ERROR_CODES.BATCH_STATE_INVALID, '请先冻结批次生成快照，再进行试算或发布', 409);
+    throw new AppError(ERROR_CODES.BATCH_STATE_INVALID, '请先结束志愿提交生成冻结快照，再生成分配方案', 409);
   }
 
   // 发布指定的、检查通过的试算结果（不重新计算）
@@ -467,7 +480,8 @@ export async function runAllocation(
   if (options.idempotencyKey) {
     const existing = db
       .prepare(
-        `SELECT id, batch_id, mode, status, result_summary, report, snapshot_hash, request_hash
+        `SELECT id, batch_id, mode, status, result_summary, report, snapshot_hash, request_hash,
+                invalidated_at AS invalidatedAt
          FROM allocation_runs WHERE idempotency_key = ?`,
       )
       .get(options.idempotencyKey) as
@@ -480,6 +494,7 @@ export async function runAllocation(
           report: string | null;
           snapshot_hash: string | null;
           request_hash: string | null;
+          invalidatedAt: string | null;
         }
       | undefined;
     if (existing) {
@@ -490,6 +505,10 @@ export async function runAllocation(
           '该幂等键已用于不同的批次、模式或请求内容，请更换幂等键后重试',
           409,
         );
+      }
+      // 重新开放提交后旧方案已失效：不能把失效结果当成有效结果复用
+      if (existing.invalidatedAt) {
+        throw conflict('该上一次生成的结果已因重新开放志愿提交而失效，请重新生成分配方案');
       }
       if (existing.snapshot_hash && existing.snapshot_hash !== snapshot.content_hash) {
         throw conflict('批次快照已变化，之前用同一幂等键生成的结果已失效，请重新执行分配');
@@ -513,8 +532,8 @@ export async function runAllocation(
   const info = db
     .prepare(
       `INSERT INTO allocation_runs
-       (batch_id, attempt, mode, status, snapshot_hash, idempotency_key, request_hash, started_at, timeout_ms, created_by, created_at, source_run_id)
-       VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (batch_id, attempt, mode, status, snapshot_hash, idempotency_key, request_hash, started_at, timeout_ms, created_by, created_at, source_run_id, stage_revision)
+       VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       batchId,
@@ -528,6 +547,7 @@ export async function runAllocation(
       actor.id,
       createdAt,
       options.sourceRunId ?? null,
+      startRevision,
     );
   const runId = Number(info.lastInsertRowid);
   const startedAt = Date.now();
@@ -568,6 +588,30 @@ export async function runAllocation(
       stableStringify(report),
       runId,
     );
+
+    // 计算期间管理员可能重新开放了志愿提交：这次结果已经过期，绝不能当作可发布方案。
+    const currentRevision =
+      (db.prepare('SELECT stage_revision FROM selection_batches WHERE id = ?').get(batchId) as
+        | { stage_revision: number }
+        | undefined)?.stage_revision ?? startRevision;
+    if (currentRevision !== startRevision) {
+      const staleAt = nowIso();
+      const staleReason = '选课活动在计算期间重新开放了志愿提交，本次结果已过期，不能发布';
+      db.prepare(
+        `UPDATE allocation_runs SET status = 'failed', failure_code = 'STAGE_REOPENED', failure_reason = ?,
+           invalidated_at = ?, invalidated_reason = ?, finished_at = ? WHERE id = ?`,
+      ).run(staleReason, staleAt, staleReason, staleAt, runId);
+      writeAudit(db, {
+        actorId: actor.id,
+        actorName: actor.username,
+        action: 'allocation.stale',
+        entityType: 'allocation_run',
+        entityId: runId,
+        summary: `计算结果已过期：${staleReason}`,
+        detail: { startRevision, currentRevision },
+      });
+      return { runId, status: 'failed', report: null, failure: { code: 'STAGE_REOPENED', reason: staleReason }, idempotentReplay: false };
+    }
 
     writeAudit(db, {
       actorId: actor.id,
@@ -1293,7 +1337,10 @@ export function publishRun(
 ): { runId: number; report: AllocationReport; idempotentReplay: boolean; alreadyPublished: boolean } {
   const run = db
     .prepare(
-      `SELECT id, batch_id, mode, status, snapshot_hash, report, result_summary FROM allocation_runs WHERE id = ?`,
+      `SELECT id, batch_id, mode, status, snapshot_hash, report, result_summary,
+              invalidated_at AS invalidatedAt, invalidated_reason AS invalidatedReason,
+              stage_revision AS stageRevision
+       FROM allocation_runs WHERE id = ?`,
     )
     .get(runId) as
     | {
@@ -1304,9 +1351,27 @@ export function publishRun(
         snapshot_hash: string | null;
         report: string | null;
         result_summary: string | null;
+        invalidatedAt: string | null;
+        invalidatedReason: string | null;
+        stageRevision: number;
       }
     | undefined;
-  if (!run) throw notFound('分配任务不存在');
+  if (!run) throw notFound('分配方案不存在');
+
+  // 重新开放志愿提交后，旧方案一律失效；即使计算任务晚到完成也不能发布过期结果
+  if (run.invalidatedAt) {
+    throw conflict(
+      `该方案已失效（${run.invalidatedReason ?? '选课活动已重新开放志愿提交'}），请重新生成分配方案后再发布`,
+    );
+  }
+
+  const batch = db.prepare('SELECT id, status, term, stage_revision FROM selection_batches WHERE id = ?').get(run.batch_id) as
+    | { id: number; status: string; term: string; stage_revision: number }
+    | undefined;
+  if (!batch) throw notFound('选课活动不存在');
+  if (run.stageRevision !== batch.stage_revision) {
+    throw conflict('该方案是旧版本的输入生成的，已经失效，请重新生成分配方案后再发布');
+  }
 
   // 重复发布同一结果：直接返回已有结果，不做任何取消/重写
   if (run.status === 'published') {
@@ -1320,17 +1385,13 @@ export function publishRun(
   if (run.status !== 'succeeded') {
     throw new AppError(
       ERROR_CODES.BATCH_STATE_INVALID,
-      `分配任务当前状态为 ${run.status}，只有检查通过的试算结果才能发布`,
+      `分配方案当前状态为 ${run.status}，只有检查通过的方案才能发布`,
       409,
     );
   }
 
-  const batch = db.prepare('SELECT id, status, term FROM selection_batches WHERE id = ?').get(run.batch_id) as
-    | { id: number; status: string; term: string }
-    | undefined;
-  if (!batch) throw notFound('批次不存在');
   if (batch.status === 'closed') {
-    throw new AppError(ERROR_CODES.BATCH_STATE_INVALID, '批次已结束，不能再发布结果', 409);
+    throw new AppError(ERROR_CODES.BATCH_STATE_INVALID, '本次选课已结束，不能再发布结果', 409);
   }
   // 一个批次只允许有一份正式结果：绝不允许用“再发布一次”覆盖或混入另一份结果
   const otherPublished = db
@@ -1338,15 +1399,15 @@ export function publishRun(
     .get(run.batch_id, runId) as { id: number } | undefined;
   if (otherPublished) {
     throw conflict(
-      `该批次已经发布过分配结果（执行 #${otherPublished.id}）。如需重新发布，请重新冻结批次并作废旧结果后再试算发布`,
+      `本次选课已经发布过结果（方案 #${otherPublished.id}）。如需重新发布，请先重新开放志愿提交并作废旧结果`,
     );
   }
-  const snapshot = db.prepare('SELECT content_hash FROM batch_snapshots WHERE batch_id = ?').get(run.batch_id) as
-    | { content_hash: string }
-    | undefined;
-  if (!snapshot) throw conflict('批次缺少冻结快照，无法发布');
+  const snapshot = db
+    .prepare('SELECT content_hash FROM batch_snapshots WHERE batch_id = ? AND invalidated_at IS NULL')
+    .get(run.batch_id) as { content_hash: string } | undefined;
+  if (!snapshot) throw conflict('本次选课没有有效的冻结快照，无法发布，请重新结束提交并生成方案');
   if (run.snapshot_hash && run.snapshot_hash !== snapshot.content_hash) {
-    throw conflict('批次快照已变化，该试算结果已失效，请重新试算后再发布');
+    throw conflict('快照已变化，该方案已失效，请重新生成分配方案后再发布');
   }
 
   const allocatedItems = db

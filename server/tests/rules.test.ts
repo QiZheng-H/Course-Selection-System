@@ -461,8 +461,8 @@ describe('志愿校验与权限', () => {
     expect(versions.length).toBeGreaterThanOrEqual(2);
   });
 
-  it('没有进行中的批次时，资格查询给出可读原因而不是报错', async () => {
-    // 找一个本学期开放的教学班，但不创建任何批次
+  it('没有开放退改选时，资格查询给出可读原因而不是报错', async () => {
+    // 找一个本学期开放的教学班，但没有任何开放正式选退课的选课活动
     const cls = ctx.db
       .prepare("SELECT id FROM teaching_classes WHERE status = 'open' ORDER BY id LIMIT 1")
       .get() as { id: number };
@@ -470,7 +470,7 @@ describe('志愿校验与权限', () => {
     const response = await request(ctx.app).get(`/api/eligibility/${cls.id}`).set(authHeader(cookie));
     expect(response.status, JSON.stringify(response.body)).toBe(200);
     expect(response.body.data.canEnroll).toBe(false);
-    expect(response.body.data.reasons.join(' ')).toContain('批次');
+    expect(response.body.data.reasons.join(' ')).toContain('选课活动');
   });
 
   it('管理员修改配置后立即生效，且非法值被拒绝或安全兜底', async () => {

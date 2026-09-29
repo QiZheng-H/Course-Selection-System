@@ -1,11 +1,15 @@
 <script setup lang="ts">
 /**
- * 培养方案核对（管理端）。
- * 管理员在这里核对演示库中的培养方案是否与学校官方文件一致：
- * 原文件、来源网址、页码、模块学分要求、课程代码/学分/必修选修/建议修读学期。
+ * 培养方案（管理端）。
+ *
+ * 这里只负责学校官方培养方案与当期开课信息分开管理：
+ *   - 培养方案以学校官方发布的《上海理工大学本科培养计划》为准，可追溯原文件、来源网址与页码；
+ *   - 教师、教学班时间与名额属于“当期开课信息”，在“资料导入”里单独维护，不能当成学校正式资料。
+ * 默认展示上海理工大学计算机科学与技术专业 2024 级本科培养方案。
  */
 import { computed, onMounted, ref } from 'vue';
 import { api } from '@/api/client';
+import { apiErrorInfo } from '@/api/errors';
 import { reportApiError } from '@/stores/toast';
 import { formatCredits } from '@/utils/labels';
 
@@ -56,7 +60,20 @@ const selectedId = ref<number | null>(null);
 const detail = ref<{ program: ProgramRow; requirements: ProgramRequirement[]; demoNotice: string | null } | null>(null);
 const demoNotice = ref<string | null>(null);
 const loading = ref(false);
+const loadError = ref('');
 const keyword = ref('');
+
+/** 默认培养方案：上海理工大学计算机科学与技术专业 2024 级本科培养方案 */
+const DEFAULT_PROGRAM = { code: '080901', grade: '2024' };
+
+function pickDefaultProgram(list: ProgramRow[]): ProgramRow | null {
+  return (
+    list.find((item) => item.code === DEFAULT_PROGRAM.code && item.grade === DEFAULT_PROGRAM.grade) ??
+    list.find((item) => item.grade === DEFAULT_PROGRAM.grade) ??
+    list[0] ??
+    null
+  );
+}
 
 const filteredRequirements = computed(() => {
   const list = detail.value?.requirements ?? [];
@@ -75,15 +92,21 @@ const totalPlanCourses = computed(() =>
 );
 
 async function loadPrograms(): Promise<void> {
+  loading.value = true;
+  loadError.value = '';
   try {
     const data = await api.get<{ programs: ProgramRow[]; demoNotice: string | null }>('/admin/programs');
     programs.value = data.programs;
     demoNotice.value = data.demoNotice;
-    if (selectedId.value === null && data.programs.length > 0) {
-      await loadDetail(data.programs[0].id);
-    }
+    const target = selectedId.value ?? pickDefaultProgram(data.programs)?.id ?? null;
+    selectedId.value = target;
+    if (target !== null) await loadDetail(target);
+    else detail.value = null;
   } catch (error) {
-    reportApiError(error, '读取培养方案失败');
+    loadError.value = apiErrorInfo(error, '读取失败').message;
+    detail.value = null;
+  } finally {
+    loading.value = false;
   }
 }
 
@@ -112,44 +135,58 @@ onMounted(loadPrograms);
   <div class="page">
     <div class="page__header">
       <div>
-        <h1 class="page__title">培养方案核对</h1>
+        <h1 class="page__title">培养方案</h1>
         <p class="page__desc">
-          核对演示库中的培养方案与学校官方文件是否一致；来源网址与页码来自官方发布页面。
+          学校官方发布的培养方案，可追溯原文件与页码。教师、教学班时间与名额属于当期开课信息，在“资料导入”里单独维护。
         </p>
       </div>
       <div class="inline">
         <label class="field" style="margin-bottom: 0">
-          <span class="field__label">培养方案</span>
+          <span class="field__label">适用对象</span>
           <select v-model.number="selectedId" class="select" @change="onProgramChange">
             <option v-for="item in programs" :key="item.id" :value="item.id">
-              {{ item.name }}（{{ item.code }} · {{ item.grade }}）
+              {{ item.major ?? item.name }} · {{ item.grade ?? '—' }} 级（{{ item.code }}）
             </option>
           </select>
         </label>
-        <button class="btn btn--ghost btn--sm" type="button" @click="loadPrograms">刷新</button>
+        <button class="btn btn--ghost btn--sm" type="button" :disabled="loading" @click="loadPrograms">刷新</button>
       </div>
     </div>
 
-    <p v-if="demoNotice" class="alert alert--info">{{ demoNotice }}</p>
+    <p v-if="loadError" class="alert alert--error">
+      <strong>读取失败</strong>：{{ loadError }}
+      <button class="btn btn--primary btn--sm" type="button" style="margin-left: 8px" @click="loadPrograms">重试</button>
+    </p>
+
+    <p v-if="demoNotice" class="alert alert--warning">{{ demoNotice }}</p>
 
     <section v-if="detail" class="card">
+      <div class="card__header">
+        <h3 class="card__title">{{ detail.program.major ?? detail.program.name }} · {{ detail.program.grade ?? '—' }} 级本科培养方案</h3>
+        <span class="badge" :class="detail.program.status === 'published' ? 'badge--ok' : 'badge--muted'">
+          {{ detail.program.status === 'published' ? '已发布' : detail.program.status }}
+        </span>
+      </div>
       <div class="inline">
-        <span class="badge">{{ detail.program.status === 'published' ? '已发布' : detail.program.status }}</span>
-        <span class="badge badge--muted">版本 {{ detail.program.version }}</span>
+        <span class="badge">专业代码 {{ detail.program.code }}</span>
+        <span class="badge badge--muted">方案版本 {{ detail.program.version }}</span>
         <span class="badge">总学分 {{ formatCredits(detail.program.totalCredits) }}</span>
         <span class="badge badge--muted">模块 {{ detail.program.requirementCount }}</span>
         <span class="badge badge--muted">官方课程 {{ totalPlanCourses }}</span>
         <span class="badge badge--muted">绑定学生 {{ detail.program.studentCount }}</span>
       </div>
       <div class="alert" style="margin-top: 10px">
-        <strong>官方来源</strong>
+        <strong>来源（学校官方文件）</strong>
         <div class="small">原文件：{{ detail.program.sourceFile ?? '—' }}</div>
         <div class="small">页码：{{ detail.program.sourcePages ?? '—' }}</div>
         <div v-if="detail.program.sourceUrl" class="small">
-          <a :href="detail.program.sourceUrl" target="_blank" rel="noopener">{{ detail.program.sourceUrl }}</a>
+          <a :href="detail.program.sourceUrl" target="_blank" rel="noopener">查看官方发布页面</a>
         </div>
         <div v-if="detail.program.sourceNote" class="small muted" style="margin-top: 6px">{{ detail.program.sourceNote }}</div>
       </div>
+      <p class="tips">
+        说明：培养方案来自学校官方文件；教师、上课时间与名额是本系统的当期开课配置，两者分开管理，请勿把模拟配置当作学校正式资料。
+      </p>
     </section>
 
     <section class="card">

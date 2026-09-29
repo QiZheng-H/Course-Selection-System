@@ -52,8 +52,17 @@ export interface WaitlistEntryDto {
 
 const DEMAND_WEIGHT: Record<DemandLevel, number> = { D2: 0, D1: 1, D0: 2 };
 
-/** 候补只能在这些阶段进行：首轮结果发布之后 */
-const WAITLIST_EDITABLE: BatchStatus[] = ['published', 'waitlist'];
+/**
+ * 候补只能在“退改选进行中”阶段编辑与递补。
+ * 首轮结果刚发布（published）时学生只能查看结果，候补不会自动递补——
+ * 这是“发布结果”和“开放退改选”两个独立动作的直接结果。
+ */
+const WAITLIST_EDITABLE: BatchStatus[] = ['waitlist'];
+
+/** 只有管理员开放退改选后才允许编辑候补 */
+export function canOperateWaitlist(status: BatchStatus): boolean {
+  return WAITLIST_EDITABLE.includes(status);
+}
 
 function getBatchOrThrow(db: SqliteDb, batchId: number) {
   const row = db.prepare('SELECT id, term, status FROM selection_batches WHERE id = ?').get(batchId) as
@@ -260,7 +269,9 @@ export function upsertWaitlistEntry(
   if (!WAITLIST_EDITABLE.includes(batch.status)) {
     throw new AppError(
       ERROR_CODES.BATCH_STATE_INVALID,
-      '当前批次状态不允许修改候补申请（首轮结果发布后才可以）',
+      batch.status === 'published'
+        ? '首轮结果已公布，管理员尚未开放退改选；此时只能查看结果，暂时不能申请候补'
+        : '当前阶段不允许修改候补申请（管理员开放退改选后才可操作）',
       409,
     );
   }
@@ -641,8 +652,9 @@ function tryPromote(
     | undefined;
   if (!entry) return 'pending';
   if (entry.status !== 'queued' && entry.status !== 'suspended') return 'pending';
-  // 批次结束后不再递补
-  if (entry.batch_status !== 'published' && entry.batch_status !== 'waitlist') return 'pending';
+  // 只有管理员开放退改选（waitlist 阶段）后才允许递补；
+  // 结果刚发布（published）时学生只能查看，候补队列保持不动。
+  if (!WAITLIST_EDITABLE.includes(entry.batch_status)) return 'pending';
 
   const classes = listOpenClassesForBatchCourse(db, entry.batch_id, entry.course_id);
   if (classes.length === 0) {
@@ -754,7 +766,7 @@ export function promoteWaitlistForClass(db: SqliteDb, classId: number): void {
       `SELECT DISTINCT we.batch_id AS batchId
        FROM waitlist_entries we JOIN selection_batches sb ON sb.id = we.batch_id
        WHERE we.course_id = ? AND we.status IN ('queued', 'suspended')
-         AND sb.status IN ('published', 'waitlist')`,
+         AND sb.status = 'waitlist'`,
     )
     .all(cls.course_id) as Array<{ batchId: number }>;
   for (const { batchId } of batches) {

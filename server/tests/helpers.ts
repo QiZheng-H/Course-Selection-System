@@ -89,22 +89,26 @@ export async function setupBatch(
   const batchId = create.body.data.id as number;
 
   const target = options.status ?? 'open';
-  const sequence: Array<'preview' | 'open' | 'frozen' | 'published' | 'waitlist'> =
-    target === 'preview'
-      ? ['preview']
-      : target === 'open'
-        ? ['preview', 'open']
-        : target === 'frozen'
-          ? ['preview', 'open', 'frozen']
-          : ['preview', 'open', 'frozen', 'waitlist'];
+  // 通用状态流转不再支持 force，且 frozen 之后不能再改状态：
+  // “结束提交”会自动生成冻结快照，“开放退改选”必须由管理员在发布结果后执行。
+  const sequence: Array<'preview' | 'open' | 'frozen'> =
+    target === 'preview' ? ['preview'] : target === 'open' ? ['preview', 'open'] : ['preview', 'open', 'frozen'];
   for (const status of sequence) {
     const transition = await request(ctx.app)
       .post(`/api/admin/batches/${batchId}/transition`)
       .set(authHeader(adminCookie))
-      .send({ status, force: true });
+      .send({ status });
     if (transition.status !== 200) {
       throw new Error(`批次状态流转到 ${status} 失败：${JSON.stringify(transition.body)}`);
     }
+  }
+  if (target === 'waitlist') {
+    // 真实流程必须是“发布结果 → 管理员开放退改选”。
+    // 这里只关心退改选阶段的选退课与候补规则，因此直接置为 waitlist，
+    // 避免每个用例都要先跑一次完整分配与发布。
+    ctx.db
+      .prepare("UPDATE selection_batches SET status = 'waitlist', published_at = COALESCE(published_at, ?) WHERE id = ?")
+      .run(new Date().toISOString(), batchId);
   }
   return { batchId, term, adminCookie };
 }

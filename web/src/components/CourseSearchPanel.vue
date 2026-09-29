@@ -1,4 +1,9 @@
 <script setup lang="ts">
+/**
+ * 课程检索面板（从原「课程检索」独立页面抽出的可复用组件）。
+ * 功能与独立页面完全一致：筛选、分页、教学班详情、资格与补选提示、选课 / 退课 / 换班、“我的已选课程”。
+ * 额外通过 `add` 事件把课程交给宿主（志愿页第 1 步用它加入「待排清单」）。
+ */
 import { computed, onMounted, reactive, ref } from 'vue';
 import { api } from '@/api/client';
 import { apiErrorInfo } from '@/api/errors';
@@ -15,6 +20,9 @@ import type {
 } from '@/api/types';
 import { courseTypeLabel, formatCredits, sourceLabel } from '@/utils/labels';
 import Pager from '@/components/Pager.vue';
+
+const props = defineProps<{ inDraft: (courseId: number) => boolean }>();
+const emit = defineEmits<{ (e: 'add', course: CourseDto): void }>();
 
 const toast = useToast();
 
@@ -79,6 +87,8 @@ async function loadCourses(page = 1): Promise<void> {
     courses.value = data.items;
     courseTotal.value = data.total;
     coursePage.value = page;
+    // 换页/改筛选后展开的那门课可能已不在列表里，收起避免留下隐藏的展开态
+    detail.value = null;
   } catch (error) {
     listError.value = apiErrorInfo(error).message;
   } finally {
@@ -122,6 +132,19 @@ async function openCourse(courseId: number): Promise<void> {
   } finally {
     detailLoading.value = false;
   }
+}
+
+function isDetailOpen(courseId: number): boolean {
+  return detail.value?.id === courseId;
+}
+
+/** 点击“查看教学班”：已展开则收起，否则展开到该课程行下面 */
+async function toggleCourse(courseId: number): Promise<void> {
+  if (isDetailOpen(courseId)) {
+    detail.value = null;
+    return;
+  }
+  await openCourse(courseId);
 }
 
 async function refreshDetail(): Promise<void> {
@@ -252,16 +275,7 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div class="page">
-    <div class="page__header">
-      <div>
-        <h1 class="page__title">课程检索与选课</h1>
-        <p class="page__desc">
-          资格、名额与冲突全部由后端判定：页面上的“可选/不可选”来自 <code>GET /api/eligibility/:classId</code>。
-        </p>
-      </div>
-    </div>
-
+  <div class="course-search-panel">
     <section class="card">
       <div class="toolbar">
         <label class="field" style="margin-bottom: 0">
@@ -328,143 +342,162 @@ onMounted(async () => {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="course in courses" :key="course.id">
-              <td class="mono">{{ course.code }}</td>
-              <td>{{ course.name }}</td>
-              <td>{{ formatCredits(course.credits) }}</td>
-              <td><span :class="`badge badge--${course.courseType}`">{{ courseTypeLabel(course.courseType) }}</span></td>
-              <td>{{ course.department ?? '—' }}</td>
-              <td>{{ course.classCount }}</td>
-              <td>{{ course.totalAvailable }} / {{ course.totalCapacity }}</td>
-              <td>
-                <button class="btn btn--sm btn--primary" type="button" @click="openCourse(course.id)">查看教学班</button>
-              </td>
-            </tr>
+            <template v-for="course in courses" :key="course.id">
+              <tr :class="{ 'course-row--open': isDetailOpen(course.id) }">
+                <td class="mono">{{ course.code }}</td>
+                <td>{{ course.name }}</td>
+                <td>{{ formatCredits(course.credits) }}</td>
+                <td><span :class="`badge badge--${course.courseType}`">{{ courseTypeLabel(course.courseType) }}</span></td>
+                <td>{{ course.department ?? '—' }}</td>
+                <td>{{ course.classCount }}</td>
+                <td>{{ course.totalAvailable }} / {{ course.totalCapacity }}</td>
+                <td>
+                  <div class="inline">
+                    <button class="btn btn--sm btn--primary" type="button" @click="toggleCourse(course.id)">
+                      {{ isDetailOpen(course.id) ? '收起教学班' : '查看教学班' }}
+                    </button>
+                    <button
+                      class="btn btn--sm btn--ghost"
+                      type="button"
+                      :disabled="props.inDraft(course.id)"
+                      @click="emit('add', course)"
+                    >
+                      {{ props.inDraft(course.id) ? '已在清单' : '加入清单' }}
+                    </button>
+                  </div>
+                </td>
+              </tr>
+
+              <!-- 教学班详情：直接在该课程行下面下拉展开 -->
+              <tr v-if="isDetailOpen(course.id)" class="course-detail-row">
+                <td colspan="8">
+                  <template v-if="detail">
+                    <div class="card__header">
+                      <h3 class="card__title">
+                        {{ detail.name }}（{{ detail.code }}，{{ formatCredits(detail.credits) }} 学分）
+                        <span :class="`badge badge--${detail.courseType}`">{{ courseTypeLabel(detail.courseType) }}</span>
+                      </h3>
+                      <div class="inline">
+                        <button class="btn btn--ghost btn--sm" type="button" :disabled="detailLoading" @click="refreshDetail">刷新</button>
+                        <button class="btn btn--ghost btn--sm" type="button" @click="detail = null">关闭</button>
+                      </div>
+                    </div>
+                    <p class="muted small">{{ detail.description ?? '暂无课程说明' }}</p>
+
+                    <div class="alert alert--info">
+                      替换/换班操作：先在下方“我的已选课程”里选择要替换掉的原教学班，再点击目标教学班的“换到此班”。
+                      系统只检查替换后的完整课表，不会出现“先退原课却没选上目标课”的中间状态。
+                    </div>
+
+                    <div v-if="enrolled.length > 0" class="toolbar" style="margin: 10px 0">
+                      <label class="field" style="margin-bottom: 0">
+                        <span class="field__label">要替换掉的原教学班</span>
+                        <select v-model.number="swapSourceClassId" class="select">
+                          <option :value="null">未选择（仅用于换班/替换）</option>
+                          <option v-for="row in enrolled" :key="row.classId" :value="row.classId">
+                            {{ row.courseCode }} {{ row.courseName }} · {{ row.classId }}（来源：{{ sourceLabel(row.source) }}）
+                          </option>
+                        </select>
+                      </label>
+                    </div>
+
+                    <div class="table-wrap">
+                      <table class="table">
+                        <thead>
+                          <tr>
+                            <th>教学班号</th>
+                            <th>教师</th>
+                            <th>时段</th>
+                            <th>容量 / 已选</th>
+                            <th>余量</th>
+                            <th>状态</th>
+                            <th>资格与依据</th>
+                            <th>操作</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr v-for="cls in detail.classes" :key="cls.id">
+                            <td class="mono">{{ cls.classCode }}<div v-if="cls.campus" class="small muted">{{ cls.campus }}</div></td>
+                            <td>
+                              {{ cls.teacher ? `${cls.teacher.name}${cls.teacher.title ? `（${cls.teacher.title}）` : ''}` : '未指定' }}
+                              <span v-if="cls.isDemo || cls.teacher?.isDemo" class="badge badge--muted">演示教师</span>
+                            </td>
+                            <td>
+                              <div v-for="session in cls.sessions" :key="session.id" class="small">{{ session.text }}</div>
+                              <div v-if="cls.note" class="small muted">{{ cls.note }}</div>
+                            </td>
+                            <td>{{ capacityText(cls) }}</td>
+                            <td>{{ availabilityText(cls) }}</td>
+                            <td>
+                              <span class="badge" :class="cls.status === 'open' ? 'badge--ok' : 'badge--danger'">
+                                {{ cls.status === 'open' ? '开放' : cls.status === 'closed' ? '关闭' : '已取消' }}
+                              </span>
+                            </td>
+                            <td>
+                              <template v-if="eligibility[cls.id]">
+                                <span class="badge" :class="eligibility[cls.id].canEnroll ? 'badge--ok' : 'badge--warn'">
+                                  {{ eligibility[cls.id].canEnroll ? '可选中' : '不可选中' }}
+                                </span>
+                                <div class="small muted">
+                                  需求等级 {{ eligibility[cls.id].demand?.demandLevel ?? '—' }}
+                                  <span v-if="eligibility[cls.id].demand?.demandLevel">（{{ eligibility[cls.id].demand?.reasons.join('；') }}）</span>
+                                </div>
+                                <div v-if="eligibility[cls.id].supplement" class="small muted">
+                                  公开补选：{{ eligibility[cls.id].supplement.allowed ? '允许' : '不允许' }}（{{ eligibility[cls.id].supplement.reason }}）
+                                </div>
+                                <ul v-if="eligibilityMessages(cls.id).length > 0" class="reason-list">
+                                  <li v-for="(message, index) in eligibilityMessages(cls.id)" :key="index">{{ message }}</li>
+                                </ul>
+                              </template>
+                              <template v-else-if="eligibilityErrors[cls.id]">
+                                <span class="badge badge--warn">资格查询失败</span>
+                                <div class="small muted">{{ eligibilityErrors[cls.id] }}</div>
+                                <div class="small muted">仍可点击“选课”，最终由后端返回资格判定结果。</div>
+                              </template>
+                              <span v-else class="muted small">查询中…</span>
+                            </td>
+                            <td>
+                              <div class="inline">
+                                <button
+                                  v-if="!isEnrolledClass(cls.id)"
+                                  class="btn btn--sm btn--primary"
+                                  type="button"
+                                  :disabled="actionLoading !== null || (Boolean(eligibility[cls.id]) && !eligibility[cls.id]?.canEnroll)"
+                                  @click="enroll(cls)"
+                                >
+                                  选课
+                                </button>
+                                <button
+                                  v-else
+                                  class="btn btn--sm btn--danger"
+                                  type="button"
+                                  :disabled="actionLoading !== null"
+                                  @click="drop(cls)"
+                                >
+                                  退课
+                                </button>
+                                <button
+                                  class="btn btn--sm btn--ghost"
+                                  type="button"
+                                  :disabled="actionLoading !== null || !swapSourceClassId || isEnrolledClass(cls.id)"
+                                  @click="swap(cls)"
+                                >
+                                  换到此班
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </template>
+                </td>
+              </tr>
+            </template>
           </tbody>
         </table>
       </div>
       <Pager :page="coursePage" :page-size="coursePageSize" :total="courseTotal" :disabled="listLoading" @change="loadCourses" />
-    </section>
-
-    <section v-if="detail" class="card">
-      <div class="card__header">
-        <h3 class="card__title">
-          {{ detail.name }}（{{ detail.code }}，{{ formatCredits(detail.credits) }} 学分）
-          <span :class="`badge badge--${detail.courseType}`">{{ courseTypeLabel(detail.courseType) }}</span>
-        </h3>
-        <div class="inline">
-          <button class="btn btn--ghost btn--sm" type="button" :disabled="detailLoading" @click="refreshDetail">刷新</button>
-          <button class="btn btn--ghost btn--sm" type="button" @click="detail = null">关闭</button>
-        </div>
-      </div>
-      <p class="muted small">{{ detail.description ?? '暂无课程说明' }}</p>
-
-      <div class="alert alert--info">
-        替换/换班操作：先在下方“我的已选课程”里选择要替换掉的原教学班，再点击目标教学班的“换到此班”。
-        系统只检查替换后的完整课表，不会出现“先退原课却没选上目标课”的中间状态。
-      </div>
-
-      <div v-if="enrolled.length > 0" class="toolbar" style="margin: 10px 0">
-        <label class="field" style="margin-bottom: 0">
-          <span class="field__label">要替换掉的原教学班</span>
-          <select v-model.number="swapSourceClassId" class="select">
-            <option :value="null">未选择（仅用于换班/替换）</option>
-            <option v-for="row in enrolled" :key="row.classId" :value="row.classId">
-              {{ row.courseCode }} {{ row.courseName }} · {{ row.classId }}（来源：{{ sourceLabel(row.source) }}）
-            </option>
-          </select>
-        </label>
-      </div>
-
-      <div class="table-wrap">
-        <table class="table">
-          <thead>
-            <tr>
-              <th>教学班号</th>
-              <th>教师</th>
-              <th>时段</th>
-              <th>容量 / 已选</th>
-              <th>余量</th>
-              <th>状态</th>
-              <th>资格与依据</th>
-              <th>操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="cls in detail.classes" :key="cls.id">
-              <td class="mono">{{ cls.classCode }}<div v-if="cls.campus" class="small muted">{{ cls.campus }}</div></td>
-              <td>
-                {{ cls.teacher ? `${cls.teacher.name}${cls.teacher.title ? `（${cls.teacher.title}）` : ''}` : '未指定' }}
-                <span v-if="cls.isDemo || cls.teacher?.isDemo" class="badge badge--muted">演示教师</span>
-              </td>
-              <td>
-                <div v-for="session in cls.sessions" :key="session.id" class="small">{{ session.text }}</div>
-                <div v-if="cls.note" class="small muted">{{ cls.note }}</div>
-              </td>
-              <td>{{ capacityText(cls) }}</td>
-              <td>{{ availabilityText(cls) }}</td>
-              <td>
-                <span class="badge" :class="cls.status === 'open' ? 'badge--ok' : 'badge--danger'">
-                  {{ cls.status === 'open' ? '开放' : cls.status === 'closed' ? '关闭' : '已取消' }}
-                </span>
-              </td>
-              <td>
-                <template v-if="eligibility[cls.id]">
-                  <span class="badge" :class="eligibility[cls.id].canEnroll ? 'badge--ok' : 'badge--warn'">
-                    {{ eligibility[cls.id].canEnroll ? '可选中' : '不可选中' }}
-                  </span>
-                  <div class="small muted">
-                    需求等级 {{ eligibility[cls.id].demand?.demandLevel ?? '—' }}
-                    <span v-if="eligibility[cls.id].demand?.demandLevel">（{{ eligibility[cls.id].demand?.reasons.join('；') }}）</span>
-                  </div>
-                  <div v-if="eligibility[cls.id].supplement" class="small muted">
-                    公开补选：{{ eligibility[cls.id].supplement.allowed ? '允许' : '不允许' }}（{{ eligibility[cls.id].supplement.reason }}）
-                  </div>
-                  <ul v-if="eligibilityMessages(cls.id).length > 0" class="reason-list">
-                    <li v-for="(message, index) in eligibilityMessages(cls.id)" :key="index">{{ message }}</li>
-                  </ul>
-                </template>
-                <template v-else-if="eligibilityErrors[cls.id]">
-                  <span class="badge badge--warn">资格查询失败</span>
-                  <div class="small muted">{{ eligibilityErrors[cls.id] }}</div>
-                  <div class="small muted">仍可点击“选课”，最终由后端返回资格判定结果。</div>
-                </template>
-                <span v-else class="muted small">查询中…</span>
-              </td>
-              <td>
-                <div class="inline">
-                  <button
-                    v-if="!isEnrolledClass(cls.id)"
-                    class="btn btn--sm btn--primary"
-                    type="button"
-                    :disabled="actionLoading !== null || (Boolean(eligibility[cls.id]) && !eligibility[cls.id]?.canEnroll)"
-                    @click="enroll(cls)"
-                  >
-                    选课
-                  </button>
-                  <button
-                    v-else
-                    class="btn btn--sm btn--danger"
-                    type="button"
-                    :disabled="actionLoading !== null"
-                    @click="drop(cls)"
-                  >
-                    退课
-                  </button>
-                  <button
-                    class="btn btn--sm btn--ghost"
-                    type="button"
-                    :disabled="actionLoading !== null || !swapSourceClassId || isEnrolledClass(cls.id)"
-                    @click="swap(cls)"
-                  >
-                    换到此班
-                  </button>
-                </div>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
     </section>
 
     <section class="card">

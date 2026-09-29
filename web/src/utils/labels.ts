@@ -1,15 +1,21 @@
 /** 展示用文案与格式化工具（只做展示，不参与任何业务判断）。 */
 import type { BatchStatus, GridSession } from '@/api/types';
 
+/** 面向业务的阶段名称（不向管理员暴露内部状态名） */
 export const BATCH_STATUS_LABEL: Record<BatchStatus, string> = {
-  preparing: '资料准备（不开放提交）',
-  preview: '预览开放（可提交）',
-  open: '正式受理（可提交/撤回）',
-  frozen: '已截止冻结（分配中）',
-  published: '结果已发布（候补与退改选）',
-  waitlist: '候补与补选阶段',
+  preparing: '资料准备',
+  preview: '预选进行中',
+  open: '预选进行中',
+  frozen: '已结束提交，待生成方案',
+  published: '结果已公布（退改选未开放）',
+  waitlist: '退改选进行中',
   closed: '已结束',
 };
+
+/** 学生现在能不能选退课：只有管理员开放退改选后才可以 */
+export function admissionOpen(status: string | null | undefined): boolean {
+  return status === 'waitlist';
+}
 
 export const COURSE_TYPE_LABEL: Record<string, string> = {
   required: '必修',
