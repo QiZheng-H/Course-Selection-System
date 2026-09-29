@@ -30,9 +30,15 @@ const enrolled = ref<EnrolledRow[]>([]);
 const planning = ref(false);
 const parsing = ref(false);
 const savingDraft = ref(false);
-const explainLoading = ref(false);
-const explainCourseId = ref<number | null>(null);
-const explain = ref<ExplainPayload | null>(null);
+
+/** “为什么是这个结果”：按课程缓存在各自条目的框里展开，不再统一放到页面底部 */
+const explainOpen = ref<Record<number, boolean>>({});
+const explainLoading = ref<Record<number, boolean>>({});
+const explainByCourse = ref<Record<number, ExplainPayload>>({});
+
+/** 规划结果下方的三个模块面板；同时展开多个时并排“挤压”显示 */
+type PanelKey = 'unmet' | 'attention' | 'progress';
+const openPanels = ref<PanelKey[]>([]);
 
 const dayOptions = [
   { value: 1, label: '周一' },
@@ -84,6 +90,10 @@ async function generatePlan(): Promise<void> {
     });
     result.value = data;
     activePlanIndex.value = 0;
+    // 重新规划后收起旧的解释与面板，避免展示与当前结果不一致的内容
+    explainOpen.value = {};
+    explainByCourse.value = {};
+    openPanels.value = [];
     parsed.value = await api
       .post<{ parsed: ParsedPreference }>('/agent/parse', { text: preferenceText.value })
       .then((res) => res.parsed)
@@ -143,18 +153,48 @@ async function savePlanToDraft(): Promise<void> {
   }
 }
 
-async function loadExplain(courseId: number): Promise<void> {
-  explainCourseId.value = courseId;
-  explainLoading.value = true;
-  explain.value = null;
+async function toggleExplain(courseId: number): Promise<void> {
+  if (explainOpen.value[courseId]) {
+    explainOpen.value = { ...explainOpen.value, [courseId]: false };
+    return;
+  }
+  explainOpen.value = { ...explainOpen.value, [courseId]: true };
+  if (explainByCourse.value[courseId]) return;
+  explainLoading.value = { ...explainLoading.value, [courseId]: true };
   try {
-    explain.value = await api.get<ExplainPayload>('/agent/explain', { courseId });
+    const data = await api.get<ExplainPayload>('/agent/explain', { courseId });
+    explainByCourse.value = { ...explainByCourse.value, [courseId]: data };
   } catch (error) {
     reportApiError(error, '读取解释失败');
   } finally {
-    explainLoading.value = false;
+    explainLoading.value = { ...explainLoading.value, [courseId]: false };
   }
 }
+
+function togglePanel(key: PanelKey): void {
+  openPanels.value = openPanels.value.includes(key)
+    ? openPanels.value.filter((item) => item !== key)
+    : [...openPanels.value, key];
+}
+
+function isPanelOpen(key: PanelKey): boolean {
+  return openPanels.value.includes(key);
+}
+
+/** “仍需关注”汇总：课表冲突 + 待确认培养要求 + 方案警告 */
+const attentionCount = computed(() => {
+  if (!result.value) return 0;
+  return (
+    result.value.conflicts.length +
+    result.value.pendingConfirmations.length +
+    (activePlan.value?.warnings.length ?? 0)
+  );
+});
+
+const unmetCount = computed(() => activePlan.value?.unmet.length ?? 0);
+const progressCount = computed(
+  () => (result.value?.requirements ?? []).filter((item) => !item.satisfied).length,
+);
 
 onMounted(async () => {
   try {
@@ -336,7 +376,9 @@ function parsedSummary(): Array<{ label: string; value: string }> {
                 <span class="badge">{{ item.classCode }}</span>
                 <span v-if="enrolledCourseIds.has(item.courseId)" class="badge badge--ok">已在你的有效选课中</span>
                 <span class="spacer"></span>
-                <button class="btn btn--ghost btn--sm" type="button" @click="loadExplain(item.courseId)">为什么是这个结果</button>
+                <button class="btn btn--ghost btn--sm" type="button" @click="toggleExplain(item.courseId)">
+                  {{ explainOpen[item.courseId] ? '收起原因' : '为什么是这个结果' }}
+                </button>
               </div>
               <div class="small muted">
                 {{ item.sessions.join('；') }}
@@ -348,116 +390,183 @@ function parsedSummary(): Array<{ label: string; value: string }> {
               <ul class="reason-list">
                 <li v-for="(reason, index) in item.reasons" :key="index">{{ reason }}</li>
               </ul>
+
+              <!-- 解释只在这个条目的框里展开 -->
+              <div v-if="explainOpen[item.courseId]" class="plan-item__explain">
+                <div v-if="explainLoading[item.courseId]" class="muted small">查询中…</div>
+                <template v-else-if="explainByCourse[item.courseId]">
+                  <div class="inline">
+                    <strong class="small">为什么选它</strong>
+                    <span v-if="explainByCourse[item.courseId].demand" class="badge badge--muted">
+                      {{ demandLabel(explainByCourse[item.courseId].demand!.level) }}
+                    </span>
+                    <span
+                      v-if="explainByCourse[item.courseId].allocation"
+                      class="badge"
+                      :class="explainByCourse[item.courseId].allocation!.decision === 'allocated' ? 'badge--ok' : 'badge--warn'"
+                    >
+                      最近判定：{{ explainByCourse[item.courseId].allocation!.decision }}
+                    </span>
+                  </div>
+                  <pre class="mono">{{ explainByCourse[item.courseId].text }}</pre>
+                  <details v-if="explainByCourse[item.courseId].sources.length > 0">
+                    <summary class="small muted">来源（{{ explainByCourse[item.courseId].sources.length }}）</summary>
+                    <div class="table-wrap" style="margin-top: 6px">
+                      <table class="table table--compact">
+                        <thead>
+                          <tr>
+                            <th>来源</th>
+                            <th>说明</th>
+                            <th>取值</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr v-for="(source, index) in explainByCourse[item.courseId].sources" :key="index">
+                            <td>{{ source.kind }}</td>
+                            <td>{{ source.description }}</td>
+                            <td>{{ source.value }}</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                  </details>
+                  <p class="tips" style="margin: 6px 0 0">
+                    排序规则：培养需求等级 → 全局志愿排名 → 固定随机键。随机键在提交志愿时固定，重交与重试都不会重抽。
+                  </p>
+                </template>
+              </div>
             </div>
           </div>
 
-          <div v-if="activePlan.unmet.length > 0" class="alert alert--warning" style="margin-top: 10px">
-            <strong>未满足项</strong>
-            <ul>
-              <li v-for="item in activePlan.unmet" :key="item.courseId">
-                {{ item.courseName }}：{{ item.reasons.join('；') }}
-              </li>
-            </ul>
-          </div>
-          <div v-if="activePlan.warnings.length > 0" class="alert alert--warning" style="margin-top: 8px">
-            <strong>警告</strong>
-            <ul>
-              <li v-for="(warning, index) in activePlan.warnings" :key="index">{{ warning }}</li>
-            </ul>
-          </div>
         </div>
       </section>
 
-      <section v-if="result.conflicts.length > 0 || result.pendingConfirmations.length > 0" class="card">
-        <h3 class="card__title">需要关注</h3>
-        <div v-if="result.conflicts.length > 0" class="alert alert--error" style="margin-top: 8px">
-          <strong>推荐方案与已落实课表存在冲突</strong>
-          <ul>
-            <li v-for="(conflict, index) in result.conflicts" :key="index">
-              {{ conflict.leftCourseName }}（{{ conflict.leftText }}）与 {{ conflict.rightCourseName }}（{{ conflict.rightText }}）
-            </li>
-          </ul>
-        </div>
-        <div v-if="result.pendingConfirmations.length > 0" class="alert alert--warning" style="margin-top: 8px">
-          <strong>仍需确认的培养要求</strong>
-          <ul>
-            <li v-for="(item, index) in result.pendingConfirmations" :key="index">{{ item }}</li>
-          </ul>
-        </div>
-      </section>
+      <!-- 三个模块按钮：做成与下方面板等宽的大卡片，点击展开，多个同时展开时并排挤压 -->
+      <div class="panel-toggle">
+        <button
+          class="panel-toggle__btn"
+          :class="{ 'panel-toggle__btn--open': isPanelOpen('unmet') }"
+          type="button"
+          @click="togglePanel('unmet')"
+        >
+          <span class="panel-toggle__label">未满足项</span>
+          <span class="panel-toggle__value">{{ unmetCount }}<span class="panel-toggle__unit">门</span></span>
+          <span class="panel-toggle__hint">{{ isPanelOpen('unmet') ? '收起原因明细' : '点击查看明细' }}</span>
+        </button>
+        <button
+          class="panel-toggle__btn"
+          :class="{ 'panel-toggle__btn--open': isPanelOpen('attention') }"
+          type="button"
+          @click="togglePanel('attention')"
+        >
+          <span class="panel-toggle__label">仍需关注</span>
+          <span class="panel-toggle__value">{{ attentionCount }}<span class="panel-toggle__unit">项</span></span>
+          <span class="panel-toggle__hint">{{ isPanelOpen('attention') ? '收起关注项' : '点击查看关注项' }}</span>
+        </button>
+        <button
+          class="panel-toggle__btn"
+          :class="{ 'panel-toggle__btn--open': isPanelOpen('progress') }"
+          type="button"
+          @click="togglePanel('progress')"
+        >
+          <span class="panel-toggle__label">培养需求进度</span>
+          <span class="panel-toggle__value">{{ progressCount }}<span class="panel-toggle__unit">项未满足</span></span>
+          <span class="panel-toggle__hint">{{ isPanelOpen('progress') ? '收起进度表' : '点击查看进度表' }}</span>
+        </button>
+      </div>
 
-      <section class="card">
-        <div class="card__header">
-          <h3 class="card__title">培养需求进度</h3>
+      <div v-if="openPanels.length > 0" class="panel-strip">
+        <!-- 未满足项 -->
+        <div v-if="isPanelOpen('unmet')" class="panel-strip__item">
+          <section class="card card--flat">
+            <div class="card__header">
+              <h3 class="card__title">未满足项</h3>
+              <button class="btn btn--ghost btn--sm" type="button" @click="togglePanel('unmet')">收起</button>
+            </div>
+            <div class="panel-strip__body">
+              <p v-if="unmetCount === 0" class="muted small" style="margin: 0">当前方案没有未满足项。</p>
+              <ul v-else class="reason-list" style="margin: 0">
+                <li v-for="item in activePlan?.unmet ?? []" :key="item.courseId">
+                  <strong>{{ item.courseName }}</strong>：{{ item.reasons.join('；') }}
+                </li>
+              </ul>
+            </div>
+          </section>
         </div>
-        <div class="table-wrap">
-          <table class="table">
-            <thead>
-              <tr>
-                <th>需求类别</th>
-                <th>要求学分</th>
-                <th>已计入</th>
-                <th>剩余</th>
-                <th>状态</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="item in result.requirements" :key="item.requirementId">
-                <td>{{ item.name }}</td>
-                <td>{{ formatCredits(item.requiredCredits) }}</td>
-                <td>{{ formatCredits(item.countedCredits) }}</td>
-                <td>{{ formatCredits(item.remainingCredits) }}</td>
-                <td>
-                  <span class="badge" :class="item.satisfied ? 'badge--ok' : 'badge--warn'">
-                    {{ item.satisfied ? '已满足' : '未满足' }}
-                  </span>
-                </td>
-              </tr>
-            </tbody>
-          </table>
+
+        <!-- 仍需关注 -->
+        <div v-if="isPanelOpen('attention')" class="panel-strip__item">
+          <section class="card card--flat">
+            <div class="card__header">
+              <h3 class="card__title">仍需关注</h3>
+              <button class="btn btn--ghost btn--sm" type="button" @click="togglePanel('attention')">收起</button>
+            </div>
+            <div class="panel-strip__body">
+              <p v-if="attentionCount === 0" class="muted small" style="margin: 0">没有需要特别关注的项。</p>
+              <template v-else>
+                <div v-if="result!.conflicts.length > 0" class="alert alert--error" style="margin-top: 0">
+                  <strong>推荐方案与已落实课表存在冲突</strong>
+                  <ul>
+                    <li v-for="(conflict, index) in result!.conflicts" :key="index">
+                      {{ conflict.leftCourseName }}（{{ conflict.leftText }}）与 {{ conflict.rightCourseName }}（{{ conflict.rightText }}）
+                    </li>
+                  </ul>
+                </div>
+                <div v-if="result!.pendingConfirmations.length > 0" class="alert alert--warning" style="margin-top: 8px">
+                  <strong>仍需确认的培养要求</strong>
+                  <ul>
+                    <li v-for="(item, index) in result!.pendingConfirmations" :key="index">{{ item }}</li>
+                  </ul>
+                </div>
+                <div v-if="(activePlan?.warnings.length ?? 0) > 0" class="alert alert--warning" style="margin-top: 8px">
+                  <strong>方案警告</strong>
+                  <ul>
+                    <li v-for="(warning, index) in activePlan?.warnings ?? []" :key="index">{{ warning }}</li>
+                  </ul>
+                </div>
+              </template>
+            </div>
+          </section>
         </div>
-      </section>
+
+        <!-- 培养需求进度 -->
+        <div v-if="isPanelOpen('progress')" class="panel-strip__item">
+          <section class="card card--flat">
+            <div class="card__header">
+              <h3 class="card__title">培养需求进度</h3>
+              <button class="btn btn--ghost btn--sm" type="button" @click="togglePanel('progress')">收起</button>
+            </div>
+            <div class="panel-strip__body">
+              <div class="table-wrap">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th>需求类别</th>
+                      <th>要求</th>
+                      <th>已计入</th>
+                      <th>剩余</th>
+                      <th>状态</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="item in result!.requirements" :key="item.requirementId">
+                      <td>{{ item.name }}</td>
+                      <td>{{ formatCredits(item.requiredCredits) }}</td>
+                      <td>{{ formatCredits(item.countedCredits) }}</td>
+                      <td>{{ formatCredits(item.remainingCredits) }}</td>
+                      <td>
+                        <span class="badge" :class="item.satisfied ? 'badge--ok' : 'badge--warn'">
+                          {{ item.satisfied ? '已满足' : '未满足' }}
+                        </span>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+        </div>
+      </div>
     </template>
-
-    <section class="card">
-      <div class="card__header">
-        <h3 class="card__title">为什么是这个结果</h3>
-        <span v-if="explainCourseId" class="muted small">课程 ID：{{ explainCourseId }}</span>
-      </div>
-      <p v-if="!explainCourseId" class="muted">在上面的方案里点击“为什么是这个结果”，或先选择一门课程。</p>
-      <div v-else-if="explainLoading" class="muted">查询中…</div>
-      <div v-else-if="explain">
-        <div class="inline">
-          <strong>{{ explain.course ? `${explain.course.name}（${explain.course.code}）` : `课程 ${explainCourseId}` }}</strong>
-          <span v-if="explain.demand" class="badge badge--muted">{{ demandLabel(explain.demand.level) }}</span>
-          <span v-if="explain.allocation" class="badge" :class="explain.allocation.decision === 'allocated' ? 'badge--ok' : 'badge--warn'">
-            最近判定：{{ explain.allocation.decision }}
-          </span>
-        </div>
-        <pre class="mono" style="white-space: pre-wrap; margin-top: 8px">{{ explain.text }}</pre>
-        <h4 style="margin-top: 10px">来源（sources）</h4>
-        <div class="table-wrap">
-          <table class="table table--compact">
-            <thead>
-              <tr>
-                <th>来源</th>
-                <th>说明</th>
-                <th>取值</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="(source, index) in explain.sources" :key="index">
-                <td>{{ source.kind }}</td>
-                <td>{{ source.description }}</td>
-                <td>{{ source.value }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-        <p class="tips" style="margin-top: 8px">
-          排序规则：培养需求等级 → 全局志愿排名 → 固定随机键。随机键在提交志愿时固定，重交与重试都不会重抽。
-        </p>
-      </div>
-    </section>
   </div>
 </template>
