@@ -973,6 +973,173 @@ ul {
 
 /* ------------------------------ 其他 ------------------------------ */
 
+/* 批次阶段条：让学生一眼看到自己在流程的哪一步 */
+.phase-strip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.phase-chip {
+  padding: 3px 10px;
+  border-radius: 12px;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg);
+  color: var(--color-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.phase-chip--done {
+  color: var(--color-success);
+  border-color: #a7f3d0;
+  background: var(--color-success-soft);
+}
+
+.phase-chip--current {
+  color: #fff;
+  border-color: var(--color-primary);
+  background: var(--color-primary);
+  font-weight: 600;
+}
+
+.phase-arrow {
+  color: var(--color-muted);
+  font-size: 12px;
+}
+
+/* 候补申请卡片：一条申请一块，状态决定左侧色条 */
+.wl-entry {
+  border: 1px solid var(--color-border);
+  border-left: 4px solid var(--color-border);
+  border-radius: 6px;
+  padding: 12px;
+  background: #fff;
+}
+
+.wl-entry--warn {
+  border-left-color: var(--color-warning);
+}
+
+.wl-entry--critical {
+  border-left-color: var(--color-danger);
+  background: #fffbfb;
+}
+
+.wl-entry--ok {
+  border-left-color: var(--color-success);
+}
+
+.wl-entry__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.wl-entry__name {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.wl-entry__line {
+  margin: 8px 0 0;
+}
+
+.wl-entry__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin-top: 6px;
+  color: var(--color-muted);
+  font-size: 12px;
+}
+
+.wl-entry__meta strong {
+  color: var(--color-text);
+}
+
+.wl-entry__action {
+  margin: 8px 0 0;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  color: var(--color-text);
+}
+
+.wl-entry__action--critical {
+  background: var(--color-danger-soft);
+  border-color: #fecaca;
+  color: #7f1d1d;
+}
+
+.wl-entry__action--ok {
+  background: var(--color-success-soft);
+  border-color: #a7f3d0;
+  color: #065f46;
+}
+
+/* 顺位进度条：越满表示离入选越近 */
+.wl-meter {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  overflow: hidden;
+  margin-top: 8px;
+}
+
+.wl-meter__fill {
+  height: 100%;
+  background: var(--color-primary);
+  transition: width 0.2s ease;
+}
+
+/* 队列顺位：只显示名次与需求等级，不显示身份 */
+.wl-queue {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.wl-chip {
+  padding: 3px 9px;
+  border-radius: 12px;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg);
+  color: #374151;
+  font-size: 12px;
+}
+
+.wl-chip--critical {
+  background: var(--color-danger-soft);
+  border-color: #fecaca;
+  color: #991b1b;
+}
+
+.wl-chip--warn {
+  background: var(--color-warning-soft);
+  border-color: #fde68a;
+  color: #92400e;
+}
+
+.wl-chip--muted {
+  color: var(--color-muted);
+}
+
+.wl-chip--me {
+  background: var(--color-info-soft);
+  border-color: var(--color-primary);
+  color: var(--color-primary-dark);
+  font-weight: 600;
+}
+
 .pager {
   display: flex;
   align-items: center;
