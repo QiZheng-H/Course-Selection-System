@@ -49,13 +49,10 @@ async function submit(): Promise<void> {
       <div class="login__brand">
         <span class="login__logo">
           <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M12 21c0-6 2-10 8-12-1 8-5 12-8 12zM12 21c0-4-1-7-5-9 0 6 2 9 5 9z" />
+            <path d="M2.5 9L12 5l9.5 4-9.5 4zM6.5 11.4V16c0 1.6 2.5 2.8 5.5 2.8s5.5-1.2 5.5-2.8v-4.6M21.5 9v5.5" />
           </svg>
         </span>
-        <span>
-          <span class="login__brand-name">课间</span>
-          <span class="login__brand-sub">Campus Planner</span>
-        </span>
+        <span class="login__brand-name login__brand-name--long">大学生选课系统</span>
       </div>
       <h1 class="login__title">大学选课系统</h1>
       <p class="login__subtitle">学生与管理员使用同一个入口，用用户名登录。</p>

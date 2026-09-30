@@ -2,7 +2,7 @@
 /**
  * 应用外壳：左侧导航 + 顶栏 + 内容区 + 页脚。
  *
- * 设计稿「课间 / CAMPUS PLANNER」：
+ * 界面采用「左侧导航 + 顶栏」的版式：
  *   - 左侧固定四个（管理端）或两组（学生端）导航，当前项加深；
  *   - 顶栏左侧是「上海理工大学 / 选课服务」面包屑，右侧是学期、当前选课活动与端别；
  *   - 底部是当前用户与一句提示，退出登录放在这里。
@@ -48,6 +48,8 @@ const ICONS: Record<string, string> = {
   layers: 'M12 3l9 5-9 5-9-5zM3 13l9 5 9-5',
   users: 'M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6M2 20c0-3 3-5 6-5s6 2 6 5M17 11a3 3 0 1 0 0-6M16 20c0-2 1-3 3-3s3 1 3 3',
   settings: 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2v.2a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-2.9-1.2l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 3.6 15H3.4a2 2 0 1 1 0-4h.2a1.7 1.7 0 0 0 1.2-2.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 10.5 4.1V3.9a2 2 0 1 1 4 0v.2a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0 1.2 2.9h.2a2 2 0 1 1 0 4z',
+  // 学士帽：与「大学生选课系统」的名称对应
+  cap: 'M2.5 9L12 5l9.5 4-9.5 4zM6.5 11.4V16c0 1.6 2.5 2.8 5.5 2.8s5.5-1.2 5.5-2.8v-4.6M21.5 9v5.5',
   leaf: 'M12 21c0-6 2-10 8-12-1 8-5 12-8 12zM12 21c0-4-1-7-5-9 0 6 2 9 5 9z',
   school: 'M3 10l9-6 9 6-9 6zM6 12.5V19c3 2 9 2 12 0v-6.5',
 };
@@ -208,13 +210,10 @@ watch(
       <div class="shell__brand">
         <span class="shell__brand-logo">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-            <path :d="iconPath('leaf')" />
+            <path :d="iconPath('cap')" />
           </svg>
         </span>
-        <span>
-          <span class="shell__brand-name">课间</span>
-          <span class="shell__brand-sub">Campus Planner</span>
-        </span>
+        <span class="shell__brand-name shell__brand-name--long">大学生选课系统</span>
       </div>
 
       <nav class="shell__nav">
@@ -296,7 +295,7 @@ watch(
       </main>
 
       <footer class="page-foot">
-        <span>课间 · 让每个新学期，都从容一点。</span>
+        <span>大学生选课系统 · 让每个新学期，都从容一点。</span>
         <span>{{ termText }}</span>
       </footer>
     </div>

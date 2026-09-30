@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * 应用入口：登录页之外统一使用「课间」外壳（左侧导航 + 顶栏 + 页脚）。
+ * 应用入口：登录页之外统一使用左侧导航 + 顶栏的外壳。
  */
 import { computed } from 'vue';
 import { useRoute } from 'vue-router';

@@ -1,7 +1,7 @@
 /* 大学选课系统：单文件全局样式（不引入任何外部 CSS / 字体 / 图片） */
 
 :root {
-  /* 「课间」视觉体系：暖白底 + 墨绿主色 + 柔和描边 */
+  /* 视觉体系：暖白底 + 墨绿主色 + 柔和描边 */
   --color-bg: #f7f6f1;
   --color-surface: #ffffff;
   --color-surface-soft: #fbfaf5;
@@ -256,6 +256,14 @@ ul {
   letter-spacing: 2px;
   color: var(--color-muted);
   text-transform: uppercase;
+}
+
+/* 中文站名比原来的两行字标更长，单独收紧字号与字距 */
+.shell__brand-name--long {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  line-height: 1.25;
 }
 
 .shell__nav {
@@ -2317,6 +2325,12 @@ ul {
   letter-spacing: 2px;
   color: var(--color-muted);
   text-transform: uppercase;
+}
+
+.login__brand-name--long {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 1px;
 }
 
 .login__title {
